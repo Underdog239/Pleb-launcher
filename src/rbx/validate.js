@@ -312,6 +312,45 @@ function unsupportedFormats(info) {
   return out;
 }
 
+/**
+ * How much of the API this build can actually carry, per format.
+ *
+ * The denominator is every value type the API mentions anywhere, taken from the
+ * full class table rather than from the properties of one instance, so the
+ * number is a property of the toolchain and not of whatever was loaded.
+ * `uncovered[format]` names the types that would be lost, which is what a
+ * caller needs to decide whether a conversion is safe.
+ */
+export function coverageReport() {
+  const used = new Map();
+  for (const info of Object.values(db().classes)) {
+    for (const entry of Object.values(info.props || {})) {
+      const type = entry[0];
+      if (!type) continue;
+      used.set(type, (used.get(type) || 0) + 1);
+    }
+  }
+
+  const types = [...used.keys()].sort();
+  const perFormat = (format) => {
+    const covered = types.filter((t) => formatSupports({ valueType: t }, format));
+    return {
+      covered: covered.length,
+      total: types.length,
+      percent: types.length === 0 ? 100 : Math.round((covered.length / types.length) * 1000) / 10,
+      // The complement of `covered`, computed the same way: an enum is always
+      // representable, so it must not appear here.
+      uncovered: types.filter((t) => !formatSupports({ valueType: t }, format)),
+    };
+  };
+
+  return {
+    totalTypes: types.length,
+    binary: perFormat('binary'),
+    xml: perFormat('xml'),
+  };
+}
+
 // --- instance / model validation -------------------------------------------
 
 const RANGES = {

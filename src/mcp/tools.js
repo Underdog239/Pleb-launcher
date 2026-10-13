@@ -9,9 +9,16 @@ import fs from 'node:fs';
 import { resolveBackend, listBackends, local } from '../backends/index.js';
 import { loadModel, saveModel, formatFor } from '../rbx/io.js';
 import { viewSvg, sceneSummary } from '../backends/local/view.js';
-import { validateModel, formatDiagnostics, summarizeDiagnostics, closestName } from '../rbx/validate.js';
+import {
+  validateModel,
+  formatDiagnostics,
+  summarizeDiagnostics,
+  closestName,
+  coverageReport,
+} from '../rbx/validate.js';
 import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
 import { buildRequireGraph, scriptsInModel } from '../luau/requires.js';
+import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
 
 /**
  * Load the model a tool was pointed at.
@@ -237,6 +244,94 @@ export const tools = [
         nodes: graph.nodes,
         diagnostics: graph.diagnostics,
       };
+    },
+  },
+  {
+    name: 'instance_references',
+    description:
+      'Report the reference graph of a model: which instances point at which through Instance-typed properties (ObjectValue, Adornee, PrimaryPart, attachments, and 300-odd more). Also reports broken references: a reference property set to nothing, or pointing at a class this property cannot hold. Pass a "path" to see one instance\'s surroundings instead of the whole graph.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model or place file' },
+        project: { type: 'string', description: 'Path to a .project.json to build and analyse instead' },
+        path: { type: 'string', description: 'Limit the report to this instance, showing what it points at and what points back' },
+        brokenOnly: { type: 'boolean', description: 'Return only the broken references' },
+      },
+    },
+    handler: (args) => {
+      const roots = args.project ? local.buildFromProject(args.project).roots : loadRoots(args.file);
+      const graph = referenceGraph(roots);
+      if (args.brokenOnly) return { broken: graph.broken };
+      if (args.path) {
+        const inst = indexByPath(roots).get(args.path);
+        if (!inst) return { path: args.path, found: false, error: `no instance at ${args.path}` };
+        return {
+          path: args.path,
+          className: inst.className,
+          outgoing: graph.edges.filter((e) => e.from === args.path),
+          incoming: graph.incoming.get(args.path) || [],
+        };
+      }
+      return {
+        nodes: graph.nodes,
+        edgeCount: graph.edges.length,
+        edges: graph.edges,
+        broken: graph.broken,
+      };
+    },
+  },
+  {
+    name: 'asset_inventory',
+    description:
+      'List every asset a model references: images, sounds, meshes, animations and skyboxes, with the asset id, the instance and property holding it, and any external (non-Roblox) URL. Use this to audit a place, find missing assets, or see what a build depends on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model or place file' },
+        project: { type: 'string', description: 'Path to a .project.json to build and analyse instead' },
+        kind: { type: 'string', description: 'Only this kind of asset, e.g. image, sound, mesh, animation' },
+      },
+    },
+    handler: (args) => {
+      const roots = args.project ? local.buildFromProject(args.project).roots : loadRoots(args.file);
+      const inventory = contentInventory(roots);
+      if (!args.kind) return inventory;
+      return { ...inventory, items: inventory.items.filter((i) => i.kind === args.kind) };
+    },
+  },
+  {
+    name: 'impact_analysis',
+    description:
+      'Answer "what breaks if I delete this?" before deleting it. Returns everything that references an instance, directly and transitively through the reference graph, ordered by distance, plus the scripts whose source mentions it (presented as mentions to verify, not as proven dependencies).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model or place file' },
+        project: { type: 'string', description: 'Path to a .project.json to build and analyse instead' },
+        path: { type: 'string', description: 'Full dot path of the instance, e.g. "Workspace.Model.Primary"' },
+      },
+      required: ['path'],
+    },
+    handler: (args) => {
+      const roots = args.project ? local.buildFromProject(args.project).roots : loadRoots(args.file);
+      return impactAnalysis(roots, args.path);
+    },
+  },
+  {
+    name: 'format_coverage',
+    description:
+      'Report which property value types this toolchain can write to binary and to XML, and name the ones it cannot. Ask this before a conversion or a build to know whether anything will be lost; the answer comes from the codecs themselves, not from a hand-maintained list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        format: { type: 'string', enum: ['binary', 'xml'], description: 'Limit the answer to one format' },
+      },
+    },
+    handler: (args) => {
+      const coverage = coverageReport();
+      if (args.format) return { totalTypes: coverage.totalTypes, [args.format]: coverage[args.format] };
+      return coverage;
     },
   },
   {

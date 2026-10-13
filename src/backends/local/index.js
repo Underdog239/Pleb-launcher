@@ -262,19 +262,102 @@ function coerceForProperty(raw, info) {
 /** Build instances from a JSON spec: { className, name, properties, children }. */
 export function modelFromSpec(spec) {
   const list = Array.isArray(spec) ? spec : [spec];
-  return list.map((node) => buildSpecNode(node));
+  const pending = [];
+  const roots = list.map((node) => buildSpecNode(node, pending));
+  // References are resolved in a second pass because a spec may point forward
+  // at an instance that has not been created yet.
+  resolveReferences(roots, pending, []);
+  return roots;
 }
 
-function buildSpecNode(node) {
+function buildSpecNode(node, pending = []) {
   const className = node.className || node.$className || 'Folder';
   if (!hasClass(className)) throw new Error(`unknown class: ${className}`);
   const inst = new Instance(className, node.name || className);
   const ser = serializationFor(className);
   for (const [prop, raw] of Object.entries(node.properties || node.$properties || {})) {
-    inst.set(prop, coerceForProperty(raw, ser.forward.get(prop)));
+    const info = ser.forward.get(prop);
+    const ref = asReference(raw, info, inst, prop);
+    if (ref) {
+      pending.push(ref);
+      continue;
+    }
+    inst.set(prop, coerceForProperty(raw, info));
   }
-  for (const child of node.children || []) inst.addChild(buildSpecNode(child));
+  for (const child of node.children || []) inst.addChild(buildSpecNode(child, pending));
   return inst;
+}
+
+/**
+ * Recognise a reference value and describe it for the second pass.
+ *
+ * A reference cannot be coerced from a literal: it names another instance, and
+ * that instance may not exist yet. So it is recorded and resolved once the whole
+ * tree is built. Three spellings are accepted:
+ *
+ *   "Workspace.Rig.Primary"                        plain string
+ *   { "$ref": "Workspace.Rig.Primary" }            explicit
+ *   { "Type": "Ref", "Value": "Workspace.Rig.Primary" }   rbx-dom's explicit form
+ *
+ * Returns null when the value is not a reference at all.
+ */
+export function asReference(raw, info, inst, prop) {
+  if (!info || info.valueType !== 'Instance') return null;
+  const owner = inst.getFullName();
+  if (typeof raw === 'string') return { owner, prop, target: raw, inst };
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (typeof raw.$ref === 'string') return { owner, prop, target: raw.$ref, inst };
+    const type = raw.Type;
+    if ((type === 'Ref' || type === 'Instance') && typeof raw.Value === 'string') {
+      return { owner, prop, target: raw.Value, inst };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve every recorded reference against the finished tree.
+ *
+ * An unresolved reference is exactly the kind of silent wrong answer this
+ * project exists to avoid, so it is always reported: the property is left unset
+ * and the caller is told which path could not be found and what the closest real
+ * one is.
+ */
+export function resolveReferences(roots, pending, warnings = []) {
+  if (!pending || pending.length === 0) return { resolved: 0, warnings };
+  const index = [];
+  for (const root of roots) {
+    for (const inst of walkInstances(root)) index.push([inst.getFullName(), inst]);
+  }
+  const byPath = new Map(index);
+  let resolved = 0;
+
+  for (const ref of pending) {
+    const wanted = ref.target.replace(/^game\./, '');
+    const target = byPath.get(wanted) || byPath.get(ref.target);
+    if (target) {
+      ref.inst.set(ref.prop, target);
+      resolved += 1;
+      continue;
+    }
+    const suggestion = closestName(wanted, [...byPath.keys()]);
+    warnings.push({
+      code: 'unresolved-reference',
+      message:
+        `${ref.owner}.${ref.prop} points at "${ref.target}", which is not in this build` +
+        (suggestion ? `; did you mean "${suggestion}"?` : ''),
+      path: `${ref.owner}.${ref.prop}`,
+      actual: ref.target,
+      suggestion,
+    });
+  }
+  return { resolved, warnings };
+}
+
+/** Every instance in a tree, roots included. */
+function* walkInstances(inst) {
+  yield inst;
+  for (const child of inst.children) yield* walkInstances(child);
 }
 
 // --- Rojo-style project build ----------------------------------------------
@@ -346,6 +429,16 @@ export function coerceProperty(raw, info) {
   return coerce(raw, type, enumKind);
 }
 
+/** The path a reference value names, whatever spelling was used. */
+export function refTarget(raw) {
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (typeof raw.$ref === 'string') return raw.$ref;
+    if (typeof raw.Value === 'string') return raw.Value;
+  }
+  return null;
+}
+
 /** Read a `.meta.json` (or `init.meta.json`) file, or null when absent. */
 function readMetaFile(filePath) {
   if (!fs.existsSync(filePath)) return null;
@@ -358,14 +451,23 @@ function readMetaFile(filePath) {
  * Apply `.meta.json` contents to an instance: `Properties` plus the
  * rbx-dom-style flat form where unknown keys are properties.
  */
-function applyMeta(inst, meta, warnings) {
+function applyMeta(inst, meta, warnings, pending = null) {
   if (!meta) return;
   const ser = serializationFor(inst.className);
   const props = meta.Properties || meta.properties || {};
   for (const [prop, raw] of Object.entries(props)) {
     // `className` selects the class; it is not a property assignment.
     if (prop === 'className' || prop === 'ClassName') continue;
-    inst.set(prop, coerceProperty(raw, ser.forward.get(prop)));
+    const info = ser.forward.get(prop);
+    // A reference cannot be set until its target exists, so it is deferred.
+    // Without a sink there is nothing to resolve it later, and quietly writing
+    // nothing would be the silent-drop failure this codebase refuses.
+    if (info && info.valueType === 'Instance') {
+      if (!pending) throw new Error(`${inst.getFullName()}.${prop}: a reference needs a build to resolve it against`);
+      pending.push({ owner: inst.getFullName(), prop, target: refTarget(raw), inst });
+      continue;
+    }
+    inst.set(prop, coerceProperty(raw, info));
   }
 
   // Attributes and Tags live in BinaryString columns this codec does not model.
@@ -405,10 +507,14 @@ export function buildFromProject(projectPath) {
   const baseDir = path.dirname(abs);
   const treeSpec = project.tree || project;
   const warnings = [];
+  const pending = [];
   const roots = Object.entries(treeSpec)
     .filter(([key]) => !key.startsWith('$'))
-    .map(([key, spec]) => buildProjectNode(key, spec, baseDir, warnings));
-  return { roots, projectName: project.name || null, warnings };
+    .map(([key, spec]) => buildProjectNode(key, spec, baseDir, warnings, null, pending));
+  // A project can wire one instance to another in either direction, so
+  // references are resolved only once every instance exists.
+  const { resolved } = resolveReferences(roots, pending, warnings);
+  return { roots, projectName: project.name || null, warnings, referencesResolved: resolved };
 }
 
 /** Load every root instance stored in a model file. */
@@ -427,7 +533,7 @@ function metaClassName(meta) {
   return meta.className || meta.ClassName || null;
 }
 
-function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = null) {
+function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = null, pending = null) {
   if (spec === null || typeof spec !== 'object') {
     throw new Error(`invalid project node: ${nodeName}`);
   }
@@ -491,7 +597,7 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
     for (const entry of entries) {
       const childPath = path.join(target, entry);
       if (fs.statSync(childPath).isDirectory()) {
-        inst.addChild(buildProjectNode(entry, { $path: childPath }, baseDir, warnings));
+        inst.addChild(buildProjectNode(entry, { $path: childPath }, baseDir, warnings, null, pending));
         continue;
       }
       if (entry.toLowerCase().startsWith('init.') && SOURCE_EXTS.has(path.extname(entry).toLowerCase())) continue;
@@ -561,7 +667,7 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
     if (cls) {
       inst.className = cls;
       inst.set('Source', fs.readFileSync(target, 'utf8'));
-      applyMeta(inst, readMetaFile(target.replace(/\.(lua|luau)$/i, '.meta.json')), warnings);
+      applyMeta(inst, readMetaFile(target.replace(/\.(lua|luau)$/i, '.meta.json')), warnings, pending);
     } else {
       const dataClass = DATA_EXTS.get(path.extname(target).toLowerCase());
       if (dataClass) {
@@ -581,17 +687,23 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
   // file always wins over a vendored model: an explicit $properties entry is a
   // stronger statement of intent than whatever the model file happened to hold.
   for (const [prop, raw] of Object.entries(spec.$properties || {})) {
-    inst.set(prop, coerceProperty(raw, ser.forward.get(prop)));
+    const info = ser.forward.get(prop);
+    const ref = pending ? asReference(raw, info, inst, prop) : null;
+    if (ref) {
+      pending.push(ref);
+      continue;
+    }
+    inst.set(prop, coerceProperty(raw, info));
   }
-  applyMeta(inst, inheritedMeta, warnings);
-  applyMeta(inst, dirMeta, warnings);
+  applyMeta(inst, inheritedMeta, warnings, pending);
+  applyMeta(inst, dirMeta, warnings, pending);
   if (modelTarget) {
-    applyMeta(inst, readMetaFile(modelTarget.replace(/\.(rbxm|rbxmx|rbxl|rbxlx)$/i, '.model.json')), warnings);
+    applyMeta(inst, readMetaFile(modelTarget.replace(/\.(rbxm|rbxmx|rbxl|rbxlx)$/i, '.model.json')), warnings, pending);
   }
 
   for (const [key, child] of Object.entries(spec)) {
     if (key.startsWith('$')) continue;
-    inst.addChild(buildProjectNode(key, child, baseDir, warnings));
+    inst.addChild(buildProjectNode(key, child, baseDir, warnings, null, pending));
   }
 
   // $ignoreUnknownInstances only affects live sync, where pre-existing

@@ -13,11 +13,12 @@ import {
   formatDiagnostics,
   summarizeDiagnostics,
   closestName,
-  formatSupports,
+  coverageReport,
 } from './rbx/validate.js';
 import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
 import { buildRequireGraph, scriptsInModel } from './luau/requires.js';
+import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
 
 const VERSION = '0.1.0';
 
@@ -75,18 +76,13 @@ export function checkEnvironment() {
   try {
     // Coverage of the value types the API actually uses, so a caller knows what
     // a build can and cannot carry before it loses something.
-    const used = new Map();
-    for (const info of Object.values(db().classes)) {
-      for (const entry of Object.values(info.props)) {
-        used.set(entry[0], (used.get(entry[0]) || 0) + 1);
-      }
-    }
-    const binary = [...used.keys()].filter((t) => formatSupports({ valueType: t }, 'binary')).length;
-    const xml = [...used.keys()].filter((t) => formatSupports({ valueType: t }, 'xml')).length;
+    const coverage = coverageReport();
     checks.push({
       name: 'value type coverage',
       ok: true,
-      detail: `${binary}/${used.size} binary, ${xml}/${used.size} xml (${used.size} types in use)`,
+      detail:
+        `${coverage.binary.covered}/${coverage.totalTypes} binary, ` +
+        `${coverage.xml.covered}/${coverage.totalTypes} xml (${coverage.totalTypes} types in use)`,
     });
   } catch (err) {
     checks.push({ name: 'value type coverage', ok: false, detail: String(err?.message || err) });
@@ -130,6 +126,8 @@ export const FLAGS = {
   limit: 'value',
   all: 'boolean',
   proxy: 'boolean',
+  // reference graph
+  broken: 'boolean',
 };
 
 const SHORT_FLAGS = { h: 'help', v: 'version', o: 'output', i: 'ignore-case' };
@@ -154,6 +152,9 @@ COMMANDS
   validate <file> [--strict]             Validate a model; non-zero exit on problems
   check <model | project.json | .luau>   Static analysis of Luau against the API
   graph <model | project.json>           Require graph: edges and cycles
+  refs <model file> [--path P]           Instance references; --broken lists bad ones
+  assets <model file> [--kind K]         Every asset the model references
+  impact <model file> <path>             What depends on an instance, transitively
   view <file> [-o out.svg] [--format F]  Approximate top-down visualisation
   diff <before> <after>                  Structural diff of two models
   edit <file> '[{"path":P,"find":A,"replace":B}]'   Edit script sources
@@ -266,7 +267,8 @@ function fail(message) {
 
 const COMMANDS = [
   'tree', 'inspect', 'read', 'grep', 'stats', 'build', 'model', 'convert',
-  'validate', 'view', 'check', 'graph', 'diff', 'edit', 'exec', 'api',
+  'validate', 'view', 'check', 'graph', 'refs', 'assets', 'impact', 'diff',
+  'edit', 'exec', 'api',
   'backends', 'tools', 'call', 'serve', 'proxy', 'doctor',
 ];
 
@@ -563,6 +565,107 @@ export async function run(argv = process.argv.slice(2)) {
           `${graph.scriptCount} script(s), ${graph.edges.length} require edge(s), ${graph.cycles.length} cycle(s)`,
         );
         if (graph.cycles.length > 0) process.exitCode = 1;
+        return out(lines.join('\n'), flags);
+      }
+
+      case 'refs': {
+        const target = rest[0];
+        if (!target) throw new Error('usage: studio refs <model file> [--path P] [--broken]');
+        const roots = loadTarget(target);
+        const graph = referenceGraph(roots);
+
+        // `--path P` scopes to one instance's surroundings: what it points at,
+        // and what points back.
+        if (flags.path) {
+          const index = indexByPath(roots);
+          const inst = index.get(flags.path);
+          if (!inst) throw new Error(`no instance at ${flags.path}`);
+          const outgoing = graph.edges.filter((e) => e.from === flags.path);
+          const incoming = graph.incoming.get(flags.path) || [];
+          const result = { path: flags.path, className: inst.className, outgoing, incoming };
+          if (flags.json) return out(result, flags);
+          const lines = [
+            `${flags.path} (${inst.className})`,
+            ...outgoing.map((e) => `  -> ${e.to}  (${e.property})`),
+            ...incoming.map((e) => `  <- ${e.from}  (${e.property})`),
+          ];
+          if (outgoing.length === 0 && incoming.length === 0) lines.push('  no references either way');
+          return out(lines.join('\n'), flags);
+        }
+
+        if (flags.broken) {
+          if (flags.json) return out({ broken: graph.broken }, flags);
+          if (graph.broken.length === 0) return out('ok: no broken references', flags);
+          process.exitCode = 1;
+          return out(
+            graph.broken
+              .map((b) => `broken [${b.property}] ${b.from}.${b.property}: ${b.reason}`)
+              .concat([`${graph.broken.length} broken reference(s)`])
+              .join('\n'),
+            flags,
+          );
+        }
+
+        if (flags.json) return out(graph, flags);
+        return out(
+          graph.edges.map((e) => `${e.from}.${e.property} -> ${e.to}`).join('\n') +
+            `\n${graph.nodes} instance(s), ${graph.edges.length} reference(s), ${graph.broken.length} broken`,
+          flags,
+        );
+      }
+
+      case 'assets': {
+        const target = rest[0];
+        if (!target) throw new Error('usage: studio assets <model file> [--kind image|sound|mesh] [--json]');
+        const inventory = contentInventory(loadTarget(target));
+        const items = flags.kind ? inventory.items.filter((i) => i.kind === flags.kind) : inventory.items;
+        if (flags.json) return out({ ...inventory, items }, flags);
+        const lines = items.map(
+          (i) => `${i.kind.padEnd(10)} ${i.raw.padEnd(40)} ${i.path}.${i.property}`,
+        );
+        lines.push(
+          `${items.length} asset reference(s), ${inventory.uniqueAssets} unique, ${inventory.external} external URL(s)`,
+        );
+        if (inventory.looseUrls.length > 0) {
+          // Not asset slots, but worth seeing: a URL where the API did not
+          // expect one is often a config indirection worth following.
+          lines.push(`${inventory.looseUrls.length} URL(s) in non-content properties:`);
+          for (const l of inventory.looseUrls) {
+            lines.push(`  ${l.raw}  ${l.path}.${l.property}`);
+          }
+        }
+        return out(lines.join('\n'), flags);
+      }
+
+      case 'impact': {
+        const target = rest[0];
+        const wanted = rest[1];
+        if (!target || !wanted) {
+          throw new Error('usage: studio impact <model file> <instance path> [--json]');
+        }
+        const result = impactAnalysis(loadTarget(target), wanted);
+        if (flags.json) return out(result, flags);
+        if (!result.found) {
+          process.exitCode = 1;
+          const lines = [`no instance at ${wanted}`];
+          if (result.suggestions.length > 0) lines.push(`  maybe: ${result.suggestions.join(', ')}`);
+          return out(lines.join('\n'), flags);
+        }
+        const lines = [
+          `${result.path} (${result.className}), ${result.childCount} child(ren)`,
+        ];
+        if (result.dependsOn.length === 0) {
+          lines.push('  nothing in this model references it');
+        } else {
+          const byDistance = result.dependsOn.slice().sort((a, b) => result.distance[a] - result.distance[b]);
+          for (const dep of byDistance) lines.push(`  <${result.distance[dep]}> ${dep}`);
+        }
+        if (result.scriptMentions.length > 0) {
+          lines.push('  scripts that mention it (check by hand):');
+          for (const m of result.scriptMentions) {
+            lines.push(`    ${m.script}:${m.lines[0].line}  ${m.lines[0].text}`);
+          }
+        }
         return out(lines.join('\n'), flags);
       }
 

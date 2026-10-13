@@ -395,3 +395,171 @@ test('script_check tool works on inline source without touching the disk', () =>
   assert.equal(result.diagnostics[0].code, 'unknown-class');
   assert.equal(result.diagnostics[0].suggestion, 'Part');
 });
+
+// --- reference graph, assets, and impact -----------------------------------
+
+/** Build a rig whose references are wired in the project file itself. */
+function makeRig(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'default.project.json'),
+    JSON.stringify({
+      name: 'Rig',
+      tree: {
+        Workspace: {
+          $className: 'Workspace',
+          Rig: {
+            $className: 'Model',
+            $properties: { PrimaryPart: 'Workspace.Rig.Primary' },
+            Primary: { $className: 'Part' },
+            Logo: { $className: 'Decal', $properties: { Texture: 'rbxassetid://1234567' } },
+          },
+          Chase: { $className: 'ObjectValue', $properties: { Value: { $ref: 'Workspace.Rig' } } },
+        },
+      },
+    }),
+  );
+  const out = path.join(dir, 'rig.rbxlx');
+  const built = cli(['build', path.join(dir, 'default.project.json'), '-o', out]);
+  assert.equal(built.status, 0, `build failed: ${built.stderr}${built.stdout}`);
+  return out;
+}
+
+test('refs and impact answer "what breaks if I delete this"', () => {
+  const dir = path.join(tmp, 'rigrefs');
+  const file = makeRig(dir);
+
+  const refs = cliJson(['refs', file, '--json']);
+  assert.deepEqual(
+    refs.edges.map((e) => `${e.from}.${e.property} -> ${e.to}`).sort(),
+    ['Workspace.Chase.Value -> Workspace.Rig', 'Workspace.Rig.PrimaryPart -> Workspace.Rig.Primary'],
+  );
+  assert.deepEqual(refs.broken, []);
+
+  const impact = cliJson(['impact', file, 'Workspace.Rig.Primary', '--json']);
+  assert.equal(impact.found, true);
+  assert.equal(impact.className, 'Part');
+  // Rig holds Primary directly; Chase holds Rig, so it is one step further out.
+  assert.equal(impact.distance['Workspace.Rig'], 1);
+  assert.equal(impact.distance['Workspace.Chase'], 2);
+});
+
+test('a project reference to something that does not exist is reported, not dropped', () => {
+  const dir = path.join(tmp, 'rigbadref');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'default.project.json'),
+    JSON.stringify({
+      name: 'Bad',
+      tree: {
+        Workspace: {
+          $className: 'Workspace',
+          Rig: { $className: 'Model', $properties: { PrimaryPart: 'Workspace.Rig.Primry' }, Primary: { $className: 'Part' } },
+        },
+      },
+    }),
+  );
+  const res = cli(['build', path.join(dir, 'default.project.json'), '-o', path.join(dir, 'bad.rbxlx')]);
+  assert.match(`${res.stdout}${res.stderr}`, /unresolved-reference/);
+  assert.match(`${res.stdout}${res.stderr}`, /Workspace\.Rig\.Primary/, 'the closest real path must be suggested');
+});
+
+test('the three reference spellings all resolve to the same target', () => {
+  const dir = path.join(tmp, 'rigspellings');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'default.project.json'),
+    JSON.stringify({
+      name: 'Spellings',
+      tree: {
+        ReplicatedStorage: {
+          $className: 'ReplicatedStorage',
+          Target: { $className: 'ObjectValue' },
+          Plain: { $className: 'ObjectValue', $properties: { Value: 'ReplicatedStorage.Target' } },
+          Explicit: { $className: 'ObjectValue', $properties: { Value: { $ref: 'game.ReplicatedStorage.Target' } } },
+          Typed: {
+            $className: 'ObjectValue',
+            $properties: { Value: { Type: 'Ref', Value: 'ReplicatedStorage.Target' } },
+          },
+        },
+      },
+    }),
+  );
+  const out = path.join(dir, 'spellings.rbxlx');
+  const built = cli(['build', path.join(dir, 'default.project.json'), '-o', out]);
+  assert.equal(built.status, 0, built.stdout + built.stderr);
+  const refs = cliJson(['refs', out, '--json']);
+  assert.equal(refs.edges.length, 3, JSON.stringify(refs.edges));
+  assert.ok(refs.edges.every((e) => e.to === 'ReplicatedStorage.Target'));
+});
+
+test('create_model accepts references between spec instances', () => {
+  const dir = path.join(tmp, 'specrefs');
+  fs.mkdirSync(dir, { recursive: true });
+  const spec = path.join(dir, 'spec.json');
+  fs.writeFileSync(
+    spec,
+    JSON.stringify({
+      className: 'Model',
+      name: 'Rig',
+      properties: { PrimaryPart: 'Rig.Primary' },
+      children: [
+        { className: 'Part', name: 'Primary' },
+        { className: 'ObjectValue', name: 'Link', properties: { Value: { $ref: 'Rig.Primary' } } },
+      ],
+    }),
+  );
+  const out = path.join(dir, 'spec.rbxm');
+  const created = cliJson(['model', spec, '-o', out, '--json']);
+  assert.equal(created.validation.ok, true, JSON.stringify(created.validation.diagnostics));
+  const refs = cliJson(['refs', out, '--json']);
+  assert.equal(refs.edges.length, 2, JSON.stringify(refs.edges));
+});
+
+test('impact on a typo exits non-zero and suggests the real path', () => {
+  const dir = path.join(tmp, 'rigimpact');
+  const file = makeRig(dir);
+  const res = cli(['impact', file, 'Workspace.Rig.Primry']);
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /no instance at Workspace\.Rig\.Primry/);
+  assert.match(res.stdout, /Workspace\.Rig\.Primary/);
+});
+
+test('refs --broken is quiet on a healthy model', () => {
+  const dir = path.join(tmp, 'rigbroken');
+  const file = makeRig(dir);
+  const res = cli(['refs', file, '--broken']);
+  assert.equal(res.status, 0, `unexpected failures: ${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /no broken references/);
+});
+
+test('assets lists every asset with its owner', () => {
+  const dir = path.join(tmp, 'rigassets');
+  const file = makeRig(dir);
+  const inventory = cliJson(['assets', file, '--json']);
+  assert.equal(inventory.total, 1);
+  assert.equal(inventory.items[0].assetId, 1234567);
+  assert.equal(inventory.items[0].kind, 'image');
+  assert.equal(inventory.items[0].path, 'Workspace.Rig.Logo');
+
+  const res = cli(['assets', file]);
+  assert.equal(res.status, 0);
+  assert.match(res.stdout, /rbxassetid:\/\/1234567/);
+  assert.match(res.stdout, /1 asset reference/);
+});
+
+test('asset_inventory, instance_references, impact_analysis and format_coverage are exposed', () => {
+  const names = cliJson(['tools']).map((t) => t.name);
+  for (const wanted of ['asset_inventory', 'instance_references', 'impact_analysis', 'format_coverage']) {
+    assert.ok(names.includes(wanted), `missing ${wanted} in ${names.join(', ')}`);
+  }
+});
+
+test('format_coverage names what cannot be written', () => {
+  const coverage = cliJson(['call', 'format_coverage', '--json', '{}']);
+  assert.equal(coverage.totalTypes, 370);
+  assert.equal(coverage.binary.covered, 363);
+  assert.equal(coverage.xml.covered, 361);
+  assert.ok(coverage.binary.uncovered.includes('QDir'));
+  assert.ok(!coverage.binary.uncovered.includes('Material'), 'an enum must not be listed as unwritable');
+});
