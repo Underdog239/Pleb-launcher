@@ -25,8 +25,18 @@ export function classInfo(className) {
   return db().classes[className] || null;
 }
 
-/** Superclass chain from `className` up to (and including) Root. */
+/**
+ * Superclass chain from `className` up to (and including) Root.
+ *
+ * Memoized: it is the inner loop of `isA`, `allPropertiesFor` and
+ * `serializationFor`, and it walks the same 935-class table every time. The
+ * returned array is shared, so treat it as read-only.
+ */
+const _chainCache = new Map();
+
 export function superChain(className) {
+  const cached = _chainCache.get(className);
+  if (cached) return cached;
   const out = [];
   let cur = className;
   const seen = new Set();
@@ -36,6 +46,7 @@ export function superChain(className) {
     const info = classInfo(cur);
     cur = info ? info.super : null;
   }
+  _chainCache.set(className, out);
   return out;
 }
 
@@ -48,7 +59,11 @@ export function isA(className, base) {
  * Subclass declarations override superclass ones.
  * @returns {Map<string, {type: string, canLoad: boolean}>}
  */
+const _allPropsCache = new Map();
+
 export function allPropertiesFor(className) {
+  const cached = _allPropsCache.get(className);
+  if (cached) return cached;
   const merged = new Map();
   // Walk base -> derived so derived declarations win.
   for (const name of superChain(className).reverse()) {
@@ -69,6 +84,9 @@ export function allPropertiesFor(className) {
       });
     }
   }
+  // Memoized because it is called per instance during validation and codec
+  // work; the map is shared, so treat it as read-only.
+  _allPropsCache.set(className, merged);
   return merged;
 }
 

@@ -75,11 +75,18 @@ export function closestName(name, candidates) {
 }
 
 /** Every property name that could legally appear on this class. */
+/** Memoized: called once per instance during validation. Returns a shared array. */
+const _knownNamesCache = new Map();
+
 export function knownPropertyNames(className) {
+  const cached = _knownNamesCache.get(className);
+  if (cached) return cached;
   const names = new Set();
   for (const name of allPropertiesFor(className).keys()) names.add(name);
   for (const name of serializationFor(className).reverse.keys()) names.add(name);
-  return [...names];
+  const out = [...names];
+  _knownNamesCache.set(className, out);
+  return out;
 }
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);

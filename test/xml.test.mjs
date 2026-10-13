@@ -69,3 +69,43 @@ test('xml round-trips refs and enums', () => {
   assert.equal(m.get('PrimaryPart'), m.children[0]);
   assert.equal(m.children[0].get('Material'), 256);
 });
+
+test('the entity fast paths do not change what is written', () => {
+  // Both encoders skip work when a string has nothing to escape. The output
+  // must be identical either way, so the escaping rules are pinned here.
+  const withText = (text) => {
+    const el = new XmlElement('t');
+    el.text = text;
+    return toXmlString(el, { declaration: false });
+  };
+  assert.equal(withText('plain text'), '<t>plain text</t>\n');
+  assert.equal(
+    withText('a < b & c > d "e" \'f\''),
+    '<t>a &lt; b &amp; c &gt; d &quot;e&quot; \'f\'</t>\n',
+  );
+  assert.equal(parseXml('<t>a &lt; b &amp; c &gt; d &quot;e&quot;</t>').text, 'a < b & c > d "e"');
+  assert.equal(parseXml('<t>plain &amp; simple</t>').text, 'plain & simple');
+  // An ampersand that is not an entity is left exactly as written.
+  assert.equal(parseXml('<t>a & b</t>').text, 'a & b');
+  assert.equal(parseXml('<t>&#65;&#x42;</t>').text, 'AB');
+});
+
+test('exotic characters survive a round trip through xml', () => {
+  // Unicode, quotes, angle brackets and control characters in a name and a
+  // script body, which is where an encoder fast path could go wrong.
+  const script = new Instance('ModuleScript', 'Esc&<>"\'');
+  script.set('Source', 'local s = "a & b < c > d \\"quoted\\""\nlocal uni = "héllo → 日本語 🚀"\nreturn s\n');
+  const folder = new Instance('Folder', 'a<b>c&d"e\'f');
+  folder.addChild(script);
+  const [back] = deserializeXml(serializeXml([folder]));
+  assert.equal(back.name, 'a<b>c&d"e\'f');
+  assert.equal(back.children[0].name, 'Esc&<>"\'');
+  assert.equal(back.children[0].get('Source'), script.get('Source'));
+});
+
+test('whitespace outside of tags is skipped, whitespace in text is not', () => {
+  const el = parseXml('<a>\n  <b>  spaced  </b>\n  <c />\n</a>');
+  assert.equal(el.find('b').text, '  spaced  ');
+  assert.equal(el.findAll('c').length, 1);
+  assert.equal(parseXml('<a\n  b="1"\n  c = \'2\'\n/>').attr('c'), '2');
+});
