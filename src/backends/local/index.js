@@ -229,7 +229,19 @@ function buildProjectNode(nodeName, spec, baseDir) {
   if (spec === null || typeof spec !== 'object') {
     throw new Error(`invalid project node: ${nodeName}`);
   }
-  const className = spec.$className || 'Folder';
+  let target = null;
+  let targetIsDir = false;
+  if (spec.$path) {
+    target = path.resolve(baseDir, spec.$path);
+    targetIsDir = fs.statSync(target).isDirectory();
+  }
+
+  let className = spec.$className || 'Folder';
+  if (target && !targetIsDir && !spec.$className) {
+    const cls = scriptClassFor(path.basename(target));
+    if (cls) className = cls;
+  }
+
   const inst = new Instance(className, nodeName);
   const ser = serializationFor(className);
 
@@ -238,10 +250,8 @@ function buildProjectNode(nodeName, spec, baseDir) {
     inst.set(prop, coerce(raw, info ? info.valueType : null));
   }
 
-  if (spec.$path) {
-    const target = path.resolve(baseDir, spec.$path);
-    const stat = fs.statSync(target);
-    if (stat.isDirectory()) {
+  if (target) {
+    if (targetIsDir) {
       for (const entry of fs.readdirSync(target).sort()) {
         const childPath = path.join(target, entry);
         if (fs.statSync(childPath).isDirectory()) {
@@ -259,11 +269,7 @@ function buildProjectNode(nodeName, spec, baseDir) {
       }
     } else {
       const cls = scriptClassFor(path.basename(target));
-      if (cls) {
-        const child = new Instance(cls, scriptNameFor(path.basename(target)));
-        child.set('Source', fs.readFileSync(target, 'utf8'));
-        inst.addChild(child);
-      }
+      if (cls) inst.set('Source', fs.readFileSync(target, 'utf8'));
     }
   }
 
