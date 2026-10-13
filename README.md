@@ -217,6 +217,12 @@ studio assets game.rbxl             # every image/sound/mesh the place uses
 studio impact game.rbxl Workspace.Rig.Primary
 studio doctor                       # what this host can actually do
 
+# Ask the API itself (no file, no Studio, no network)
+studio api class Sound              # properties, types, what a file saves
+studio api enum Material            # items and their numeric values
+studio api property Health          # which classes can hold it
+studio api search anchored          # classes, enums, enum items, properties
+
 # Change it
 studio edit game.rbxl '[{"path":"ServerScriptService.Main","find":"print(","replace":"warn("}]'
 
@@ -488,6 +494,7 @@ Tools exposed (names mirror Studio's own MCP server where they overlap):
 | `build` | yes | yes | Rojo-style project -> place |
 | `convert` | yes | yes | binary <-> XML |
 | `validate_model` | yes | yes | structured diagnostics + suggestions |
+| `api_lookup` | yes | yes | class/enum/property questions about the API |
 | `script_check` | yes | yes | static analysis of Luau against the API |
 | `require_graph` | yes | yes | require edges, cycles, dynamic requires |
 | `instance_references` | yes | yes | reference graph + broken references |

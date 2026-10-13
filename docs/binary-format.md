@@ -1,7 +1,21 @@
 # Roblox binary model format (rbxm / rbxl)
 
-Reverse-engineered spec used by `src/rbx/binary.js`. Verified against
-[rbx-dom](https://github.com/rojo-rbx/rbx-dom) (`rbx_binary`).
+The spec `src/rbx/binary.js` implements, following
+[rbx-dom](https://github.com/rojo-rbx/rbx-dom) (`rbx_binary`), the reference
+implementation.
+
+Two things verify it, and it is worth being precise about which does what:
+
+- `test/binary-format.test.mjs` pins the exact on-disk bytes — interleaving,
+  zigzag, float bit-rotation, serialized names, footer — against an independent
+  reimplementation of rbx-dom's transforms in the test itself. A self-consistent
+  encoding bug cannot hide behind our own decoder.
+- The two-way differential run against rbx-dom itself lives in
+  `scripts/verify-with-lune.luau` and needs the Lune runtime, which is fetched
+  from a GitHub release asset. **That run has not been performed in the
+  environment this code was written in**, so nothing here claims a completed
+  cross-implementation check — see "Verification against the reference
+  implementation" in the README for the procedure.
 
 ## File header
 

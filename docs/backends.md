@@ -23,6 +23,13 @@ keys, no network.
 - Simulate physics or run services (`Players`, `RunService`, `DataStoreService`).
 - Render anything faithful. `view_scene` projects axis-aligned bounding boxes.
 
+**Can do without a file at all**
+
+The reflection database is complete enough to answer questions about the API
+itself, so `api class`, `api enum`, `api property` and `api search` (the
+`api_lookup` MCP tool) work with no model, no Studio and no network. That is the
+surface an agent reaches for while writing code rather than inspecting it.
+
 This is a *file and structure* tool. It is exact about the data model and
 honest about the fact that it is not the engine.
 
