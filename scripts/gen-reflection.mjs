@@ -30,13 +30,14 @@ async function load(source) {
   return JSON.parse(fs.readFileSync(source, 'utf8'));
 }
 
-function valueTypeName(member) {
+function valueTypeOf(member) {
   const vt = member.ValueType || member.DataType;
   if (!vt) return null;
   // Properties typed as a specific class (e.g. Model.PrimaryPart: BasePart)
-  // are stored as instance references.
-  if (vt.Category === 'Class') return 'Instance';
-  return vt.Name;
+  // serialize as instance references, but we keep the class name so validation
+  // can check that a reference actually points at a legal target.
+  if (vt.Category === 'Class') return { type: 'Instance', refClass: vt.Name };
+  return { type: vt.Name, refClass: null };
 }
 
 function build(dump) {
@@ -46,13 +47,14 @@ function build(dump) {
     for (const m of cls.Members) {
       if (m.MemberType !== 'Property') continue;
       const serialization = m.Serialization || {};
-      const type = valueTypeName(m);
-      if (!type) continue;
-      // [valueType, canLoad, canSave]
+      const vt = valueTypeOf(m);
+      if (!vt) continue;
+      // [valueType, canLoad, canSave, refClass]
       props[m.Name] = [
-        type,
+        vt.type,
         serialization.CanLoad === false ? 0 : 1,
         serialization.CanSave ? 1 : 0,
+        vt.refClass,
       ];
     }
     const tags = cls.Tags || [];

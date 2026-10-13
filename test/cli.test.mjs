@@ -153,3 +153,98 @@ test('execute_luau reports that it needs Studio on this host', () => {
     assert.match(res.stderr, /studio backend|Studio/i);
   }
 });
+
+test('model refuses to write an unknown property and suggests a fix', () => {
+  const spec = path.join(tmp, 'bad-prop.json');
+  fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'P', properties: { Sizee: [1, 1, 1] } }));
+  const outPath = path.join(tmp, 'bad-prop.rbxm');
+
+  const res = cli(['model', spec, '-o', outPath]);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /not a valid property/);
+  assert.match(res.stderr, /did you mean: Size/);
+  assert.equal(fs.existsSync(outPath), false, 'must not write an invalid model');
+
+  const parsed = JSON.parse(res.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.diagnostics[0].suggestion, 'Size');
+});
+
+test('model refuses a wrong value type', () => {
+  const spec = path.join(tmp, 'bad-type.json');
+  fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'P', properties: { Size: 'oops' } }));
+  const res = cli(['model', spec, '-o', path.join(tmp, 'bad-type.rbxm')]);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /expected \{x, y, z\}/);
+});
+
+test('--force writes despite validation errors', () => {
+  const spec = path.join(tmp, 'bad-force.json');
+  fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'P', properties: { Sizee: [1, 1, 1] } }));
+  const outPath = path.join(tmp, 'forced.rbxm');
+  const res = cli(['model', spec, '-o', outPath, '--force']);
+  assert.equal(res.status, 0);
+  assert.ok(fs.existsSync(outPath));
+});
+
+test('validate reports problems and exits non-zero', () => {
+  const spec = path.join(tmp, 'valid.json');
+  fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'P', properties: { Size: [1, 1, 1] } }));
+  const good = path.join(tmp, 'valid.rbxm');
+  cliJson(['model', spec, '-o', good]);
+
+  const ok = cli(['validate', good]);
+  assert.equal(ok.status, 0);
+  assert.match(ok.stdout, /ok: 1 instances, no problems/);
+
+  const okJson = cliJson(['validate', good, '--json']);
+  assert.equal(okJson.ok, true);
+
+  // Now validate a file that was forced out with a bad property.
+  const badSpec = path.join(tmp, 'badv.json');
+  fs.writeFileSync(badSpec, JSON.stringify({ className: 'Part', name: 'P', properties: { Material: 999999 } }));
+  const badFile = path.join(tmp, 'badv.rbxm');
+  cli(['model', badSpec, '-o', badFile, '--force']);
+
+  const bad = cli(['validate', badFile]);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stdout, /FAILED/);
+});
+
+test('mcp create_model reports validation failures as an error result', () => {
+  const input = [
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'create_model',
+        arguments: {
+          spec: { className: 'Part', name: 'P', properties: { Sizee: [1, 1, 1] } },
+          output: path.join(tmp, 'mcp-bad.rbxm'),
+        },
+      },
+    }),
+    '',
+  ].join('\n');
+
+  const res = cli(['serve'], input);
+  const lines = res.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  const call = lines.find((m) => m.id === 2);
+  assert.equal(call.result.isError, true);
+  assert.match(call.result.content[0].text, /did you mean: Size/);
+  assert.equal(fs.existsSync(path.join(tmp, 'mcp-bad.rbxm')), false);
+});
+
+test('validate_model tool is exposed', () => {
+  const input = [
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    '',
+  ].join('\n');
+  const res = cli(['serve'], input);
+  const list = JSON.parse(res.stdout.trim().split('\n')[0]);
+  const names = list.result.tools.map((t) => t.name);
+  assert.ok(names.includes('validate_model'));
+});
+

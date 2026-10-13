@@ -31,6 +31,55 @@ programmatically. This project fills the rest of the gap:
 - **Execute** Luau with full engine fidelity through Studio when available.
 - **Speak MCP**, so agents talk to it exactly like they talk to Studio's own
   built-in MCP server.
+- **Fail loudly.** Every write is validated first; a bad property or wrong type
+  is rejected with a path, an expectation, and a suggested fix — never silently
+  dropped.
+
+## Validation
+
+This is the part that matters most for agents. Without it, a misspelled property
+or a wrong value type is silently discarded and the agent ships a file that
+looks fine and is wrong. `studio model`, `studio build` and the `create_model`
+/ `build` MCP tools all validate **before writing**, and refuse to write on
+error.
+
+```bash
+studio model tower.json -o tower.rbxm
+# error: Part.Sizee is not a valid property of Part
+#   did you mean: Size?
+# FAILED: 1 instances, 1 error(s), 0 warning(s)
+
+studio validate tower.rbxm                  # human-readable
+studio validate tower.rbxm --json           # machine-readable diagnostics
+studio model tower.json -o t.rbxm --force   # write anyway
+```
+
+Diagnostics are structured, so an agent can act on them:
+
+```json
+{
+  "severity": "error",
+  "code": "unknown-property",
+  "message": "Part.Sizee is not a valid property of Part",
+  "path": "P.Sizee",
+  "actual": "Sizee",
+  "suggestion": "Size"
+}
+```
+
+| code | severity | meaning |
+|---|---|---|
+| `unknown-property` | error | property does not exist on the class, with a did-you-mean |
+| `invalid-value` | error | wrong shape/type for the property's value type |
+| `invalid-enum-item` | error | unknown enum item name, with a did-you-mean |
+| `invalid-enum-value` | error | numeric enum value outside the domain (0 = unset, always legal) |
+| `invalid-reference` | error | a `Ref` pointing at the wrong class (`PrimaryPart` must be a `BasePart`) |
+| `unknown-class` | error | class not in the API dump, with a did-you-mean |
+| `out-of-range` | warning | e.g. `Transparency` outside 0..1 |
+| `color-out-of-range` | warning | a `Color3` channel outside 0..1 |
+| `duplicate-name` | warning | two siblings with the same name |
+
+`--strict` promotes warnings to failures.
 
 ## Install
 
@@ -57,6 +106,7 @@ studio read game.rbxl ServerScriptService.Main
 studio model tower.json -o tower.rbxm
 studio build default.project.json -o game.rbxl
 studio convert tower.rbxm tower.rbxmx
+studio validate tower.rbxm
 
 # Perceive it
 studio view tower.rbxm -o tower.svg
@@ -126,6 +176,7 @@ Tools exposed (names mirror Studio's own MCP server where they overlap):
 | `create_model` | yes | yes | JSON spec -> `.rbxm`/`.rbxmx` |
 | `build` | yes | yes | Rojo-style project -> place |
 | `convert` | yes | yes | binary <-> XML |
+| `validate_model` | yes | yes | structured diagnostics + suggestions |
 | `view_scene` | yes | yes | approximate SVG / JSON |
 | `execute_luau` | no | yes | real engine, command-bar permission |
 | `api_dump` | no | yes | Studio's API surface |
@@ -145,6 +196,7 @@ src/
     xml.js               rbxmx/rbxlx XML codec
     reflection.js        class/property/enum database + serialization mapping
     instance.js          in-memory instance tree
+    validate.js          validation + structured diagnostics
     datatypes.js         Vector3/CFrame/Color3/... + rotation IDs
     io.js                format dispatch by extension
   util/
@@ -193,7 +245,8 @@ node scripts/gen-patches.mjs        # needs network
 ## Tests
 
 ```bash
-npm test          # 32 tests: LZ4, binary codec, XML codec, reflection, CLI, MCP
+npm test          # 52 tests: LZ4, binary codec, XML codec, reflection,
+                  # validation, CLI, MCP
 ```
 
 ## Verification against the reference implementation

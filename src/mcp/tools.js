@@ -10,6 +10,7 @@ import { resolveBackend, listBackends, local } from '../backends/index.js';
 import { loadModel, saveModel, formatFor } from '../rbx/io.js';
 import { viewSvg, sceneSummary } from '../backends/local/view.js';
 import { Instance } from '../rbx/instance.js';
+import { validateModel, formatDiagnostics } from '../rbx/validate.js';
 
 function loadRoots(file) {
   if (!file) return [new Instance('Folder', 'Workspace')];
@@ -81,14 +82,25 @@ export const tools = [
         spec: { type: 'object', description: 'Instance spec: { className, name, properties, children }' },
         specFile: { type: 'string', description: 'Path to a JSON spec file (alternative to spec)' },
         output: { type: 'string', description: 'Output model file path' },
+        strict: { type: 'boolean', description: 'Also fail on warnings' },
       },
       required: ['output'],
     },
     handler: (args) => {
       const spec = args.spec || JSON.parse(fs.readFileSync(args.specFile, 'utf8'));
       const roots = local.modelFromSpec(spec);
+      const validation = validateModel(roots, { strict: !!args.strict });
+      if (!validation.ok) {
+        // Refuse to write a model we know is wrong; surface the diagnostics.
+        throw new Error(formatDiagnostics(validation));
+      }
       const bytes = saveModel(args.output, roots);
-      return { output: args.output, bytes, roots: roots.map((r) => r.getFullName()) };
+      return {
+        output: args.output,
+        bytes,
+        roots: roots.map((r) => r.getFullName()),
+        validation,
+      };
     },
   },
   {
@@ -99,13 +111,34 @@ export const tools = [
       properties: {
         project: { type: 'string', description: 'Path to project JSON' },
         output: { type: 'string' },
+        strict: { type: 'boolean', description: 'Also fail on warnings' },
       },
       required: ['project', 'output'],
     },
     handler: (args) => {
       const { roots, projectName } = local.buildFromProject(args.project);
+      const validation = validateModel(roots, { strict: !!args.strict });
+      if (!validation.ok) throw new Error(formatDiagnostics(validation));
       const bytes = saveModel(args.output, roots);
-      return { output: args.output, bytes, projectName, stats: local.stats(roots) };
+      return { output: args.output, bytes, projectName, stats: local.stats(roots), validation };
+    },
+  },
+  {
+    name: 'validate_model',
+    description:
+      'Validate a model file (or an inline spec) and return structured diagnostics: unknown properties with suggestions, wrong value types, invalid enum items, invalid references, and out-of-range values. Use this before trusting a model.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model file to validate' },
+        spec: { type: 'object', description: 'Instance spec to validate instead of a file' },
+        strict: { type: 'boolean', description: 'Treat warnings as failures' },
+      },
+    },
+    handler: (args) => {
+      const roots = args.spec ? local.modelFromSpec(args.spec) : loadRoots(args.file);
+      const result = validateModel(roots, { strict: !!args.strict });
+      return { ...result, summary: formatDiagnostics(result) };
     },
   },
   {

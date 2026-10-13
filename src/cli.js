@@ -6,6 +6,7 @@ import { loadModel, saveModel, formatFor } from './rbx/io.js';
 import { viewSvg, sceneSummary } from './backends/local/view.js';
 import { runStdioServer } from './mcp/server.js';
 import { toolList, callTool } from './mcp/tools.js';
+import { validateModel, formatDiagnostics } from './rbx/validate.js';
 
 const VERSION = '0.1.0';
 
@@ -22,6 +23,7 @@ COMMANDS
   build <project.json> -o <out>          Build a Rojo-style project
   model <spec.json> -o <out>             Create a model from a JSON spec
   convert <in> <out>                     Convert binary <-> XML model files
+  validate <file> [--strict]             Validate a model; non-zero exit on problems
   view <file> [-o out.svg] [--format F]  Approximate top-down visualisation
   exec <script.luau> [--place F]         Run Luau in Studio (studio backend)
   api dump [-o out.json]                 Dump Studio's API surface
@@ -32,6 +34,8 @@ COMMANDS
 
 GLOBAL OPTIONS
   --backend <auto|local|studio>   Which engine to use (default: auto)
+  --strict                        Treat warnings as failures
+  --force                         Write even when validation fails
   --json                          Machine-readable output only
   -h, --help                      Show this help
   -v, --version                   Show version
@@ -56,6 +60,8 @@ function parseArgs(argv) {
     else if (a === '--json') flags.json = true;
     else if (a === '--spec') flags.spec = argv[++i];
     else if (a === '--kind') flags.kind = argv[++i];
+    else if (a === '--strict') flags.strict = true;
+    else if (a === '--force') flags.force = true;
     else positional.push(a);
   }
   return { positional, flags };
@@ -67,7 +73,9 @@ function out(value, flags) {
 }
 
 function fail(message) {
-  process.stderr.write(`error: ${message}\n`);
+  // Validation diagnostics already carry their own severity prefixes.
+  const text = /^(error|warning):/.test(message) ? message : `error: ${message}`;
+  process.stderr.write(`${text}\n`);
   process.exitCode = 1;
 }
 
@@ -116,16 +124,34 @@ export async function run(argv = process.argv.slice(2)) {
       case 'build': {
         const { roots, projectName } = local.buildFromProject(rest[0]);
         const target = flags.output || 'out.rbxl';
+        const validation = validateModel(roots, { strict: flags.strict });
+        if (!validation.ok && !flags.force) {
+          process.stderr.write(`${formatDiagnostics(validation)}\n`);
+          process.exitCode = 1;
+          return out(validation, flags);
+        }
         const bytes = saveModel(target, roots);
-        return out({ output: target, bytes, projectName, stats: local.stats(roots) }, flags);
+        return out(
+          { output: target, bytes, projectName, stats: local.stats(roots), validation },
+          flags,
+        );
       }
 
       case 'model': {
         const spec = JSON.parse(fs.readFileSync(flags.spec || rest[0], 'utf8'));
         const target = flags.output || 'out.rbxm';
         const roots = local.modelFromSpec(spec);
+        const validation = validateModel(roots, { strict: flags.strict });
+        if (!validation.ok && !flags.force) {
+          process.stderr.write(`${formatDiagnostics(validation)}\n`);
+          process.exitCode = 1;
+          return out(validation, flags);
+        }
         const bytes = saveModel(target, roots);
-        return out({ output: target, bytes, roots: roots.map((r) => r.getFullName()) }, flags);
+        return out(
+          { output: target, bytes, roots: roots.map((r) => r.getFullName()), validation },
+          flags,
+        );
       }
 
       case 'convert': {
@@ -141,6 +167,14 @@ export async function run(argv = process.argv.slice(2)) {
           },
           flags,
         );
+      }
+
+      case 'validate': {
+        const roots = loadModel(rest[0]);
+        const validation = validateModel(roots, { strict: flags.strict });
+        if (!validation.ok) process.exitCode = 1;
+        if (flags.json) return out(validation, flags);
+        return out(formatDiagnostics(validation), flags);
       }
 
       case 'view': {

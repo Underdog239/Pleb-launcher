@@ -128,44 +128,73 @@ export { loadModel, saveModel, formatFor, createInstance };
 
 // --- value coercion ---------------------------------------------------------
 
-/** Coerce a JSON value into the representation a property expects. */
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const nums = (v, n) => Array.isArray(v) && v.length === n && v.every(isNum);
+
+/**
+ * Coerce a JSON value into the representation a property expects.
+ *
+ * Coercion is deliberately *strict about shape*: anything it cannot interpret
+ * is returned untouched so the validation layer reports it. Silently defaulting
+ * a malformed value (e.g. a string passed where a Vector3 belongs) is how an
+ * agent ends up shipping a 0,0,0 part while believing it built a real one.
+ */
 export function coerce(value, valueType) {
   if (value === null || value === undefined) return value;
+
   if (isEnumValueType(valueType)) {
     if (typeof value === 'number') return value;
     const v = enumValue(valueType, String(value));
     if (v === undefined) throw new Error(`unknown ${valueType} item: ${value}`);
     return v;
   }
-  const arr = Array.isArray(value);
+
   switch (valueType) {
-    case 'Vector3':
-      return arr ? v3(value[0], value[1], value[2]) : v3(value.x, value.y, value.z);
     case 'Vector2':
-      return arr ? v2(value[0], value[1]) : v2(value.x, value.y);
-    case 'Color3':
-      return arr ? color3(value[0], value[1], value[2]) : color3(value.r, value.g, value.b);
-    case 'Color3uint8':
-      return arr ? { r: value[0], g: value[1], b: value[2] } : value;
-    case 'UDim':
-      return arr ? udim(value[0], value[1]) : udim(value.scale, value.offset);
-    case 'UDim2':
-      return arr ? udim2(udim(value[0], value[1]), udim(value[2], value[3])) : value;
-    case 'CFrame':
-      if (arr) {
-        return cframe(
-          v3(value[0], value[1], value[2]),
-          value.length > 3 ? value.slice(3) : IDENTITY_ROTATION,
-        );
+      if (nums(value, 2)) return v2(value[0], value[1]);
+      if (value && isNum(value.x) && isNum(value.y)) return v2(value.x, value.y);
+      return value;
+    case 'Vector3':
+    case 'Vector3int16':
+      if (nums(value, 3)) return v3(value[0], value[1], value[2]);
+      if (value && isNum(value.x) && isNum(value.y) && isNum(value.z)) {
+        return v3(value.x, value.y, value.z);
       }
-      return cframe(
-        v3(value.position.x, value.position.y, value.position.z),
-        value.rotation || IDENTITY_ROTATION,
-      );
+      return value;
+    case 'Color3':
+      if (nums(value, 3)) return color3(value[0], value[1], value[2]);
+      if (value && isNum(value.r) && isNum(value.g) && isNum(value.b)) {
+        return color3(value.r, value.g, value.b);
+      }
+      return value;
+    case 'Color3uint8':
+      if (nums(value, 3)) return { r: value[0], g: value[1], b: value[2] };
+      if (value && isNum(value.r) && isNum(value.g) && isNum(value.b)) return { ...value };
+      return value;
+    case 'UDim':
+      if (nums(value, 2)) return udim(value[0], value[1]);
+      if (value && isNum(value.scale) && isNum(value.offset)) return udim(value.scale, value.offset);
+      return value;
+    case 'UDim2':
+      if (nums(value, 4)) return udim2(udim(value[0], value[1]), udim(value[2], value[3]));
+      if (value && value.x && value.y && isNum(value.x.scale) && isNum(value.y.scale)) return value;
+      return value;
+    case 'CFrame':
+      if (nums(value, 3)) return cframe(v3(value[0], value[1], value[2]), IDENTITY_ROTATION);
+      if (nums(value, 12)) {
+        return cframe(v3(value[0], value[1], value[2]), value.slice(3));
+      }
+      if (value && value.position && nums(value.rotation, 9)) {
+        return cframe(v3(value.position.x, value.position.y, value.position.z), value.rotation);
+      }
+      return value;
     case 'NumberRange':
-      return arr ? { min: value[0], max: value[1] } : value;
+      if (nums(value, 2)) return { min: value[0], max: value[1] };
+      if (value && isNum(value.min) && isNum(value.max)) return value;
+      return value;
     case 'Rect':
-      return arr ? { min: v2(value[0], value[1]), max: v2(value[2], value[3]) } : value;
+      if (nums(value, 4)) return { min: v2(value[0], value[1]), max: v2(value[2], value[3]) };
+      return value;
     default:
       return value;
   }

@@ -54,8 +54,13 @@ export function allPropertiesFor(className) {
   for (const name of superChain(className).reverse()) {
     const info = classInfo(name);
     if (!info) continue;
-    for (const [prop, [type, canLoad, canSave]] of Object.entries(info.props)) {
-      merged.set(prop, { type, canLoad: canLoad === 1, canSave: canSave === 1 });
+    for (const [prop, [type, canLoad, canSave, refClass]] of Object.entries(info.props)) {
+      merged.set(prop, {
+        type,
+        canLoad: canLoad === 1,
+        canSave: canSave === 1,
+        refClass: refClass || null,
+      });
     }
   }
   return merged;
@@ -65,7 +70,9 @@ export function allPropertiesFor(className) {
 export function propertiesFor(className) {
   const merged = new Map();
   for (const [name, info] of allPropertiesFor(className)) {
-    if (info.canSave) merged.set(name, { type: info.type, canLoad: info.canLoad });
+    if (info.canSave) {
+      merged.set(name, { type: info.type, canLoad: info.canLoad, refClass: info.refClass });
+    }
   }
   return merged;
 }
@@ -152,7 +159,13 @@ export function serializationFor(className) {
       else valueType = p.as;
     }
     const canonicalType = info.type;
-    forward.set(name, { serializedName, valueType, canonicalType, canLoad: info.canLoad });
+    forward.set(name, {
+      serializedName,
+      valueType,
+      canonicalType,
+      refClass: info.refClass,
+      canLoad: info.canLoad,
+    });
     reverse.set(serializedName, { canonicalName: name, valueType, canonicalType });
   }
 
