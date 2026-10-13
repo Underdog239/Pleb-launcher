@@ -309,3 +309,89 @@ test('doctor reports what the host can do', () => {
   assert.ok(names.includes('serialization patches'));
   assert.ok(checks.every((c) => typeof c.ok === 'boolean' && typeof c.detail === 'string'));
 });
+
+// --- Luau static analysis through the CLI ----------------------------------
+
+test('check reports Luau problems and exits non-zero', () => {
+  const src = path.join(tmp, 'bad.luau');
+  fs.writeFileSync(src, 'local p = Instance.new("Part")\np.Sizee = 1\nlocal q = Instance.new("Prat")\n');
+  const res = cli(['check', src]);
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /\[property-typo\]/);
+  assert.match(res.stdout, /\[unknown-class\]/);
+  assert.match(res.stdout, /no such property, did you mean Size\?/);
+});
+
+test('check --json returns the same machine-readable shape as the validator', () => {
+  const src = path.join(tmp, 'bad2.luau');
+  fs.writeFileSync(src, 'wait(1)\n');
+  const result = cliJson(['check', src, '--json']);
+  assert.equal(result.ok, true, 'a deprecation warning must not fail the check');
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.warningCount, 1);
+  assert.equal(result.diagnostics[0].code, 'deprecated-global');
+  assert.equal(result.diagnostics[0].suggestion, 'task.wait');
+});
+
+test('check on a clean script exits zero and says so', () => {
+  const src = path.join(tmp, 'good.luau');
+  fs.writeFileSync(src, 'local p = Instance.new("Part")\np.Anchored = true\nreturn p\n');
+  const res = cli(['check', src]);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stdout, /no problems/);
+});
+
+test('check and graph work directly on a project file', () => {
+  const dir = path.join(tmp, 'proj');
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'default.project.json'),
+    JSON.stringify({
+      name: 'Proj',
+      tree: {
+        ReplicatedStorage: { $className: 'ReplicatedStorage', Mod: { $path: 'src/Mod.luau' } },
+      },
+    }),
+  );
+  fs.writeFileSync(path.join(dir, 'src', 'Mod.luau'), 'return require(script.Parent.Gone)\n');
+
+  const checked = cli(['check', path.join(dir, 'default.project.json')]);
+  assert.equal(checked.status, 1);
+  assert.match(checked.stdout, /\[require-not-found\]/);
+
+  const graph = cliJson(['graph', path.join(dir, 'default.project.json'), '--json']);
+  assert.equal(graph.scriptCount, 1);
+  assert.equal(graph.edges.length, 0);
+});
+
+test('graph reports a require cycle and exits non-zero', () => {
+  const dir = path.join(tmp, 'cycle');
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'default.project.json'),
+    JSON.stringify({
+      name: 'Cycle',
+      tree: { ReplicatedStorage: { $className: 'ReplicatedStorage', S: { $path: 'src' } } },
+    }),
+  );
+  fs.writeFileSync(path.join(dir, 'src', 'A.luau'), 'return require(script.Parent.B)\n');
+  fs.writeFileSync(path.join(dir, 'src', 'B.luau'), 'return require(script.Parent.A)\n');
+
+  const res = cli(['graph', path.join(dir, 'default.project.json')]);
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /CYCLE: ReplicatedStorage\.S\.A -> ReplicatedStorage\.S\.B/);
+});
+
+test('script_check and require_graph tools are exposed', () => {
+  const tools = cliJson(['tools']);
+  const names = tools.map((t) => t.name);
+  assert.ok(names.includes('script_check'), `missing script_check in ${names.join(', ')}`);
+  assert.ok(names.includes('require_graph'), `missing require_graph in ${names.join(', ')}`);
+});
+
+test('script_check tool works on inline source without touching the disk', () => {
+  const result = cliJson(['call', 'script_check', '--json', JSON.stringify({ source: 'local x = Instance.new("Prat")\n' })]);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics[0].code, 'unknown-class');
+  assert.equal(result.diagnostics[0].suggestion, 'Part');
+});

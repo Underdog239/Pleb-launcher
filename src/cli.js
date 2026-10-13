@@ -1,6 +1,7 @@
 // studio-cli — Roblox Studio as a command line interface for agents.
 
 import fs from 'node:fs';
+import path from 'node:path';
 import { listBackends, resolveBackend, local, studio } from './backends/index.js';
 import { loadModel, saveModel, formatFor } from './rbx/io.js';
 import { viewSvg, sceneSummary } from './backends/local/view.js';
@@ -15,6 +16,8 @@ import {
   formatSupports,
 } from './rbx/validate.js';
 import { db, serializationFor } from './rbx/reflection.js';
+import { analyzeSource, summarizeScripts } from './luau/analyze.js';
+import { buildRequireGraph, scriptsInModel } from './luau/requires.js';
 
 const VERSION = '0.1.0';
 
@@ -149,6 +152,8 @@ COMMANDS
   model <spec.json> -o <out>             Create a model from a JSON spec
   convert <in> <out>                     Convert binary <-> XML model files
   validate <file> [--strict]             Validate a model; non-zero exit on problems
+  check <model | project.json | .luau>   Static analysis of Luau against the API
+  graph <model | project.json>           Require graph: edges and cycles
   view <file> [-o out.svg] [--format F]  Approximate top-down visualisation
   diff <before> <after>                  Structural diff of two models
   edit <file> '[{"path":P,"find":A,"replace":B}]'   Edit script sources
@@ -261,9 +266,54 @@ function fail(message) {
 
 const COMMANDS = [
   'tree', 'inspect', 'read', 'grep', 'stats', 'build', 'model', 'convert',
-  'validate', 'view', 'diff', 'edit', 'exec', 'api', 'backends', 'tools',
-  'call', 'serve', 'proxy', 'doctor',
+  'validate', 'view', 'check', 'graph', 'diff', 'edit', 'exec', 'api',
+  'backends', 'tools', 'call', 'serve', 'proxy', 'doctor',
 ];
+
+/** Extensions treated as a bare Luau source file rather than a model. */
+const LUAU_EXTS = new Set(['.lua', '.luau']);
+
+/**
+ * Load whatever the user pointed at. A `.project.json` is built into a tree
+ * first, so `check` and `graph` work on the project an agent is actually
+ * editing, not just on an already-built file.
+ */
+export function loadTarget(target) {
+  if (LOOKS_LIKE_PROJECT(target)) {
+    return local.buildFromProject(target).roots;
+  }
+  return loadModel(target);
+}
+
+function LOOKS_LIKE_PROJECT(target) {
+  return /\.project\.json$/i.test(target) || /(^|[\\/])default\.json$/i.test(target);
+}
+
+/** Render script diagnostics the way the model validator renders its own. */
+export function formatScriptDiagnostics(result) {
+  if (result.diagnostics.length === 0) {
+    return `ok: ${result.scriptCount} script(s), no problems`;
+  }
+  const lines = result.diagnostics.map((d) => {
+    const tag = d.severity === 'error' ? 'error' : d.severity === 'warning' ? 'warning' : 'note';
+    // The code is included in the text form too: it is the one token an agent
+    // (or a grep) can key on without parsing prose.
+    const code = d.code ? ` [${d.code}]` : '';
+    const where = d.line ? `${d.file}:${d.line}:${d.col ?? 1}: ` : d.file ? `${d.file}: ` : '';
+    let line = `${tag}${code} ${where}${d.message}`;
+    // Several messages already spell the fix out; don't say it twice.
+    if (d.suggestion && !String(d.message).includes(d.suggestion)) {
+      line += `\n  did you mean: ${d.suggestion}?`;
+    }
+    if (d.hint) line += `\n  ${d.hint}`;
+    return line;
+  });
+  lines.push(
+    `${result.ok ? 'ok' : 'FAILED'}: ${result.scriptCount} script(s), ` +
+      `${result.errorCount} error(s), ${result.warningCount} warning(s)`,
+  );
+  return lines.join('\n');
+}
 
 export async function run(argv = process.argv.slice(2)) {
   let parsed;
@@ -465,6 +515,55 @@ export async function run(argv = process.argv.slice(2)) {
           throw new Error('api dump needs the studio backend (Studio --api/--fullApi/--apiV2).');
         }
         return out(studio.apiDump({ outputFile: flags.output, kind: flags.kind || 'full' }), flags);
+      }
+
+      case 'check': {
+        const target = rest[0];
+        if (!target) throw new Error('usage: studio check <model file | script.luau> [--json]');
+        const ext = path.extname(target).toLowerCase();
+
+        if (LUAU_EXTS.has(ext)) {
+          // A loose script: no tree, so require targets cannot be resolved.
+          const source = fs.readFileSync(target, 'utf8');
+          const { diagnostics } = analyzeSource(source, { file: target });
+          const result = summarizeScripts(diagnostics, { scripts: 1 });
+          if (!result.ok) process.exitCode = 1;
+          if (flags.json) return out(result, flags);
+          return out(formatScriptDiagnostics(result), flags);
+        }
+
+        const roots = loadTarget(target);
+        const scripts = scriptsInModel(roots);
+        const diagnostics = [];
+        for (const script of scripts) {
+          const { diagnostics: found } = analyzeSource(script.source, { file: script.path });
+          diagnostics.push(...found);
+        }
+        // With the tree in hand, requires can be resolved for real.
+        const graph = buildRequireGraph(scripts, roots);
+        diagnostics.push(...graph.diagnostics.filter((d) => d.code !== 'dynamic-require'));
+        const notes = graph.diagnostics.filter((d) => d.code === 'dynamic-require');
+        const result = summarizeScripts(diagnostics, { scripts: scripts.length });
+        if (!result.ok) process.exitCode = 1;
+        if (flags.json) {
+          return out({ ...result, requireEdges: graph.edges.length, cycles: graph.cycles.length, notes }, flags);
+        }
+        return out(formatScriptDiagnostics(result), flags);
+      }
+
+      case 'graph': {
+        const target = rest[0];
+        if (!target) throw new Error('usage: studio graph <model file | project.json> [--json]');
+        const roots = loadTarget(target);
+        const graph = buildRequireGraph(scriptsInModel(roots), roots);
+        if (flags.json) return out(graph, flags);
+        const lines = graph.edges.map((e) => `${e.from} -> ${e.to}`);
+        for (const cycle of graph.cycles) lines.push(`CYCLE: ${cycle.join(' -> ')}`);
+        lines.push(
+          `${graph.scriptCount} script(s), ${graph.edges.length} require edge(s), ${graph.cycles.length} cycle(s)`,
+        );
+        if (graph.cycles.length > 0) process.exitCode = 1;
+        return out(lines.join('\n'), flags);
       }
 
       case 'diff': {

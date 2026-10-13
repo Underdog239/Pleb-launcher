@@ -10,6 +10,8 @@ import { resolveBackend, listBackends, local } from '../backends/index.js';
 import { loadModel, saveModel, formatFor } from '../rbx/io.js';
 import { viewSvg, sceneSummary } from '../backends/local/view.js';
 import { validateModel, formatDiagnostics, summarizeDiagnostics, closestName } from '../rbx/validate.js';
+import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
+import { buildRequireGraph, scriptsInModel } from '../luau/requires.js';
 
 /**
  * Load the model a tool was pointed at.
@@ -169,6 +171,72 @@ export const tools = [
       const format = args.format || (args.file ? formatFor(args.file) : 'binary');
       const result = validateModel(roots, { strict: !!args.strict, format });
       return { ...result, summary: formatDiagnostics(result) };
+    },
+  },
+  {
+    name: 'script_check',
+    description:
+      'Statically analyse Luau source against the real Roblox API and report problems: unknown classes passed to Instance.new, classes that cannot be created, unknown services, unknown enums and enum items, typos in property names, and deprecated functions. Every diagnostic carries a line, a column, and a suggested fix. Accepts a model file (every script inside it is checked), a directory, or a single .lua/.luau file. Use this to review generated or edited code before running it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model file, a .lua/.luau source file, or a directory of scripts' },
+        source: { type: 'string', description: 'Luau source to check directly, instead of a file' },
+        project: { type: 'string', description: 'Path to a .project.json; every script it builds is checked with its tree intact' },
+        includeRequires: {
+          type: 'boolean',
+          description: 'When checking a model or project, also resolve require() chains and report missing targets, non-module targets, and cycles (default true)',
+        },
+      },
+    },
+    handler: (args) => {
+      if (typeof args.source === 'string') {
+        const { diagnostics, errors } = analyzeSource(args.source, { file: 'input.luau' });
+        const result = summarizeScripts(diagnostics, { scripts: 1 });
+        return { ...result, lexErrors: errors };
+      }
+
+      const roots = args.project ? local.buildFromProject(args.project).roots : loadRoots(args.file);
+      const scripts = scriptsInModel(roots);
+      const diagnostics = [];
+      for (const script of scripts) {
+        const { diagnostics: found } = analyzeSource(script.source, { file: script.path });
+        diagnostics.push(...found);
+      }
+
+      let graph = null;
+      if (args.includeRequires !== false) {
+        graph = buildRequireGraph(scripts, roots);
+        diagnostics.push(...graph.diagnostics);
+      }
+      const result = summarizeScripts(diagnostics, { scripts: scripts.length });
+      return {
+        ...result,
+        ...(graph ? { requireEdges: graph.edges.length, cycles: graph.cycles } : {}),
+      };
+    },
+  },
+  {
+    name: 'require_graph',
+    description:
+      'Build the require() graph of a place: which script requires which, as concrete instance paths. Reports edges, cycles, and scripts whose requires are computed at runtime and therefore not knowable statically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Path to a model or place file' },
+        project: { type: 'string', description: 'Path to a .project.json to build and analyse instead' },
+      },
+    },
+    handler: (args) => {
+      const roots = args.project ? local.buildFromProject(args.project).roots : loadRoots(args.file);
+      const graph = buildRequireGraph(scriptsInModel(roots), roots);
+      return {
+        scriptCount: graph.scriptCount,
+        edges: graph.edges,
+        cycles: graph.cycles,
+        nodes: graph.nodes,
+        diagnostics: graph.diagnostics,
+      };
     },
   },
   {
