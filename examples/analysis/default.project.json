@@ -1,0 +1,4 @@
+{ "name": "Demo", "tree": {
+  "ReplicatedStorage": { "$className": "ReplicatedStorage", "Shared": { "$path": "src/shared" } },
+  "ServerScriptService": { "$className": "ServerScriptService", "Main": { "$path": "src/server/Main.server.luau" } }
+}}

@@ -1,0 +1,18 @@
+{
+  "name": "References",
+  "tree": {
+    "Workspace": {
+      "$className": "Workspace",
+      "Rig": {
+        "$className": "Model",
+        "$properties": { "PrimaryPart": "Workspace.Rig.Primary" },
+        "Primary": { "$className": "Part" },
+        "Handle": { "$className": "ObjectValue", "$properties": { "Value": { "$ref": "Workspace.Rig.Primary" } } }
+      },
+      "Chase": {
+        "$className": "ObjectValue",
+        "$properties": { "Value": { "Type": "Ref", "Value": "Workspace.Rig" } }
+      }
+    }
+  }
+}

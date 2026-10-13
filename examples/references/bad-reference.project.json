@@ -1,0 +1,13 @@
+{
+  "name": "BadReference",
+  "tree": {
+    "Workspace": {
+      "$className": "Workspace",
+      "Rig": {
+        "$className": "Model",
+        "$properties": { "PrimaryPart": "game.Workspace.Rig.Primry" },
+        "Primary": { "$className": "Part" }
+      }
+    }
+  }
+}
