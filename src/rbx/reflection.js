@@ -65,8 +65,10 @@ export function allPropertiesFor(className) {
   const cached = _allPropsCache.get(className);
   if (cached) return cached;
   const merged = new Map();
-  // Walk base -> derived so derived declarations win.
-  for (const name of superChain(className).reverse()) {
+  // Walk base -> derived so derived declarations win. `.toReversed()` rather
+  // than `.reverse()`: the chain is a shared cached array, and reversing it in
+  // place would corrupt the cache for every later caller.
+  for (const name of superChain(className).toReversed()) {
     const info = classInfo(name);
     if (!info) continue;
     for (const [prop, entry] of Object.entries(info.props)) {
@@ -125,7 +127,7 @@ function isFontDatatype(className, propName) {
  * @param {string} propName
  * @param {string} typeName
  */
-function resolveIsEnum(chain, propName, typeName) {
+export function resolveIsEnum(chain, propName, typeName) {
   if (!isEnumValueType(typeName)) return false;
   if (typeName !== 'Font') return true;
   for (const cls of chain) {
@@ -134,13 +136,28 @@ function resolveIsEnum(chain, propName, typeName) {
   return true;
 }
 
-/** Only properties the engine actually persists to model files. */
+/**
+ * Properties a model file can actually hold for this class.
+ *
+ * This is deliberately derived from `serializationFor` rather than from the
+ * dump's `CanSave` flag, because the two disagree and the codec is right: the
+ * engine writes `BasePart.Size` under the legacy name `size`, marks
+ * `Instance.Archivable` as unsavable and persists it as `archivable`, and does
+ * the same for `Sandboxed`/`DefinesCapabilities`. A `CanSave`-only list misses
+ * all of those, so it did not describe the files this project writes.
+ */
 export function propertiesFor(className) {
+  const all = allPropertiesFor(className);
   const merged = new Map();
-  for (const [name, info] of allPropertiesFor(className)) {
-    if (info.canSave) {
-      merged.set(name, { type: info.type, canLoad: info.canLoad, refClass: info.refClass });
-    }
+  for (const name of serializationFor(className).forward.keys()) {
+    const info = all.get(name);
+    if (!info) continue;
+    merged.set(name, {
+      type: info.type,
+      canLoad: info.canLoad,
+      refClass: info.refClass,
+      declaredOn: info.declaredOn,
+    });
   }
   return merged;
 }

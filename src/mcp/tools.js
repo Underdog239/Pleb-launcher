@@ -19,6 +19,7 @@ import {
 import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from '../luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
+import { describeClass, describeEnum, classesWithProperty, searchApi } from '../rbx/api.js';
 
 /**
  * Load the model a tool was pointed at.
@@ -335,6 +336,39 @@ export const tools = [
       const coverage = coverageReport();
       if (args.format) return { totalTypes: coverage.totalTypes, [args.format]: coverage[args.format] };
       return coverage;
+    },
+  },
+  {
+    name: 'api_lookup',
+    description:
+      'Answer questions about the Roblox API itself, with no Studio and no network: what properties a class has and what type each one is, whether they are saved to model files or runtime-only, the members of an enum with their numeric values, which classes can hold a given property, and free-text search across classes, enums, enum items and properties. Use this to write correct code before checking it, e.g. to confirm a property name, its type, or that Instance.new works for a class.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: ['class', 'enum', 'property', 'search'],
+          description: 'class = one class and its properties; enum = one enum and its items; property = which classes hold it; search = free text',
+        },
+        name: { type: 'string', description: 'Class name, enum name, property name, or search term' },
+        all: { type: 'boolean', description: 'For kind=class: also list dump-internal entries that are not reachable from a file' },
+        limit: { type: 'integer', description: 'For kind=search: maximum results per category (default 40)' },
+      },
+      required: ['kind', 'name'],
+    },
+    handler: (args) => {
+      switch (args.kind) {
+        case 'class':
+          return describeClass(args.name, { all: !!args.all });
+        case 'enum':
+          return describeEnum(args.name);
+        case 'property':
+          return classesWithProperty(args.name);
+        case 'search':
+          return searchApi(args.name, { limit: args.limit || 40 });
+        default:
+          throw new Error(`kind must be one of class, enum, property, search; got ${JSON.stringify(args.kind)}`);
+      }
     },
   },
   {

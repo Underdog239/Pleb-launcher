@@ -19,6 +19,7 @@ import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from './luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
+import { describeClass, describeEnum, classesWithProperty, searchApi } from './rbx/api.js';
 
 const VERSION = '0.1.0';
 
@@ -159,7 +160,11 @@ COMMANDS
   diff <before> <after>                  Structural diff of two models
   edit <file> '[{"path":P,"find":A,"replace":B}]'   Edit script sources
   exec <script.luau> [--place F]         Run Luau in Studio (studio backend)
-  api dump [-o out.json]                 Dump Studio's API surface
+  api dump [-o out.json]                 Dump Studio's API surface (needs Studio)
+  api class <ClassName>                  Properties, types, and what is saved
+  api enum <EnumName>                    Items and their numeric values
+  api property <Name>                    Which classes can hold this property
+  api search <term>                      Search classes, enums and enum items
   backends                               List backends and capabilities
   doctor                                 Report what this host can actually do
   tools                                  List MCP tools
@@ -271,6 +276,14 @@ const COMMANDS = [
   'edit', 'exec', 'api',
   'backends', 'tools', 'call', 'serve', 'proxy', 'doctor',
 ];
+
+/** Report a name that does not exist, with the closest real one, and exit 1. */
+function notFoundWith(term, suggestions, flags) {
+  process.exitCode = 1;
+  const lines = [`no such name: ${term}`];
+  if (suggestions && suggestions.length > 0) lines.push(`  did you mean: ${suggestions.join(', ')}?`);
+  return out(lines.join('\n'), flags);
+}
 
 /** Extensions treated as a bare Luau source file rather than a model. */
 const LUAU_EXTS = new Set(['.lua', '.luau']);
@@ -512,11 +525,101 @@ export async function run(argv = process.argv.slice(2)) {
       }
 
       case 'api': {
-        if (rest[0] !== 'dump') throw new Error('usage: studio api dump [-o out.json]');
-        if (backend.name !== 'studio') {
-          throw new Error('api dump needs the studio backend (Studio --api/--fullApi/--apiV2).');
+        const topic = rest[0];
+        const term = rest[1];
+
+        // `api dump` is Studio's own dump, and needs Studio.
+        if (topic === 'dump') {
+          if (backend.name !== 'studio') {
+            throw new Error('api dump needs the studio backend (Studio --api/--fullApi/--apiV2).');
+          }
+          return out(studio.apiDump({ outputFile: flags.output, kind: flags.kind || 'full' }), flags);
         }
-        return out(studio.apiDump({ outputFile: flags.output, kind: flags.kind || 'full' }), flags);
+
+        // Everything else is answered from the bundled reflection database, so
+        // it works with no Studio and no network.
+        if (topic === 'class') {
+          if (!term) throw new Error('usage: studio api class <ClassName> [--json]');
+          const info = describeClass(term, { all: !!flags.all });
+          if (flags.json) return out(info, flags);
+          if (!info.found) return notFoundWith(term, info.suggestions, flags);
+
+          const row = (p) =>
+            `  ${p.name}${' '.repeat(Math.max(1, 32 - p.name.length))}${p.type}` +
+            `${p.enum ? ' (enum)' : ''}${p.referenceTo ? ` -> ${p.referenceTo}` : ''}` +
+            `${p.serializedName && p.serializedName !== p.name ? `  [saved as ${p.serializedName}]` : ''}` +
+            `${p.declaringClass === info.name ? '' : `  (from ${p.declaringClass})`}`;
+
+          const lines = [
+            `${info.name}  (extends ${info.superclass})`,
+            info.isService
+              ? '  a service: get it with game:GetService'
+              : info.creatable
+                ? '  creatable: Instance.new works'
+                : '  not creatable: the engine provides it',
+            `  ${info.savedCount} propert${info.savedCount === 1 ? 'y' : 'ies'} saved to model files`,
+            ...info.properties.map(row),
+          ];
+          if (info.runtimeProperties.length > 0) {
+            lines.push('', `  ${info.runtimeOnlyCount} runtime-only (never saved to a file)`);
+            lines.push(...info.runtimeProperties.map(row));
+          }
+          if (info.hiddenProperties) {
+            lines.push('', `  ${info.hiddenCount} dump-internal entries (not reachable from a file)`);
+            lines.push(...info.hiddenProperties.map(row));
+          } else if (info.hiddenCount > 0) {
+            lines.push('', `  ${info.hiddenCount} further dump-internal entries; --all lists them`);
+          }
+          return out(lines.join('\n'), flags);
+        }
+
+        if (topic === 'enum') {
+          if (!term) throw new Error('usage: studio api enum <EnumName> [--json]');
+          const info = describeEnum(term);
+          if (flags.json) return out(info, flags);
+          if (!info.found) return notFoundWith(term, info.suggestions, flags);
+          return out(
+            [`${info.name}  (${info.count} items)`, ...info.items.map((i) => `  ${i.name} = ${i.value}`)].join('\n'),
+            flags,
+          );
+        }
+
+        if (topic === 'property') {
+          if (!term) throw new Error('usage: studio api property <PropertyName> [--json]');
+          const info = classesWithProperty(term);
+          if (flags.json) return out(info, flags);
+          if (!info.found) return notFoundWith(term, info.suggestions, flags);
+          return out(
+            [
+              `${info.name}: ${info.type}, declared on ${info.declaringClass}; ` +
+                `${info.count} class(es) can hold it`,
+              ...info.classes.slice(0, 40).map(
+                (c) =>
+                  `  ${c.className}${' '.repeat(Math.max(1, 30 - c.className.length))}${c.type}` +
+                  `${c.declaringClass === c.className ? '  (declares)' : `  (from ${c.declaringClass})`}`,
+              ),
+              ...(info.count > 40 ? [`  ... and ${info.count - 40} more`] : []),
+            ].join('\n'),
+            flags,
+          );
+        }
+
+        if (topic === 'search') {
+          if (!term) throw new Error('usage: studio api search <term> [--json]');
+          const result = searchApi(term, { limit: Number(flags.limit) || 40 });
+          if (flags.json) return out(result, flags);
+          const lines = [
+            ...result.classes.map((c) => `class    ${c.name}${c.isService ? '  (service)' : ''}`),
+            ...result.enums.map((e) => `enum     ${e.name}  (${e.count} items)`),
+            ...result.enumItems.map((i) => `item     ${i.enum}.${i.name} = ${i.value}`),
+            ...result.properties.map((p) => `property ${p.name}  ${p.type}  (on ${p.declaringClass})`),
+          ];
+          if (lines.length === 0) lines.push(`nothing matches "${term}"`);
+          else if (result.truncated) lines.push('... more results exist; use --limit');
+          return out(lines.join('\n'), flags);
+        }
+
+        throw new Error('usage: studio api <class|enum|property|search|dump> <name> [--json]');
       }
 
       case 'check': {
