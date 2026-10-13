@@ -193,8 +193,30 @@ node scripts/gen-patches.mjs        # needs network
 ## Tests
 
 ```bash
-npm test          # 26 tests: LZ4, binary codec, XML codec, reflection, CLI, MCP
+npm test          # 32 tests: LZ4, binary codec, XML codec, reflection, CLI, MCP
 ```
+
+## Verification against the reference implementation
+
+Round-tripping through our own codec only proves self-consistency. The binary
+and XML writers are therefore also verified against **rbx-dom**, the reference
+implementation, via [Lune](https://lune-org.github.io/docs):
+
+```bash
+# one-time: grab the Lune binary for your platform
+gh release download v0.11.0 -R lune-org/lune -p 'lune-*-linux-x86_64.zip'
+
+studio model examples/tower.json -o /tmp/tower.rbxm
+lune run scripts/verify-with-lune.luau /tmp/tower.rbxm Tower.Shaft
+#   Size = 4, 12, 4
+#   CFrame = 0, 6.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1
+#   Material = Enum.Material.Concrete
+```
+
+`test/binary-format.test.mjs` additionally pins the exact on-disk bytes
+(interleaving, zigzag, float bit-rotation, serialized names, footer) against an
+independent reimplementation of rbx-dom's transforms, so a self-consistent
+encoding bug cannot hide behind our own decoder.
 
 ## License
 

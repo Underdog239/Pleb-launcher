@@ -236,8 +236,8 @@ function encodeProperty(serializedName, valueType, value, ctx) {
       break;
     case 'SecurityCapabilities':
     case 'UniqueId':
-      el.text = String(Number(value && value.index !== undefined ? value.index : value) || 0);
-      break;
+      // rbx_xml uses a fixed-width textual form we do not model; skip.
+      return null;
 
     default:
       el.text = value == null ? '' : String(value);
@@ -465,9 +465,8 @@ export function serializeXml(roots, options = {}) {
     const ser = serializationFor(inst.className);
     for (const canonical of [...ser.forward.keys()].filter((n) => n !== 'Name').sort()) {
       const { serializedName, valueType } = ser.forward.get(canonical);
-      propsEl.children.push(
-        encodeProperty(serializedName, valueType, inst.props.get(canonical), ctx),
-      );
+      const propEl = encodeProperty(serializedName, valueType, inst.props.get(canonical), ctx);
+      if (propEl) propsEl.children.push(propEl);
     }
 
     itemEl.children.push(propsEl);
@@ -476,7 +475,8 @@ export function serializeXml(roots, options = {}) {
   };
 
   for (const r of roots) root.children.push(build(r));
-  return toXmlString(root, options);
+  // rbx_xml (and Rojo) omit the XML declaration; some readers sniff on it.
+  return toXmlString(root, { declaration: false, ...options });
 }
 
 export { ELEM_REVERSE };

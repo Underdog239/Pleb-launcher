@@ -112,9 +112,11 @@ export function untransformI64(v) {
 
 /** f32 bit rotation applied to every float in interleaved float arrays. */
 export function rotateF32Bits(bits) {
-  return ((bits >>> 1) | (bits << 31)) >>> 0;
+  // rotate_left(1)
+  return (((bits << 1) | (bits >>> 31)) >>> 0) >>> 0;
 }
 
 export function unrotateF32Bits(bits) {
-  return (((bits << 1) | (bits >>> 31)) >>> 0) >>> 0;
+  // rotate_right(1)
+  return ((bits >>> 1) | (bits << 31)) >>> 0;
 }
