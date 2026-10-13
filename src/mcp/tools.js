@@ -17,7 +17,7 @@ import {
   coverageReport,
 } from '../rbx/validate.js';
 import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
-import { buildRequireGraph, scriptsInModel } from '../luau/requires.js';
+import { buildRequireGraph, checkTreeBindings, scriptsInModel } from '../luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
 
 /**
@@ -183,7 +183,7 @@ export const tools = [
   {
     name: 'script_check',
     description:
-      'Statically analyse Luau source against the real Roblox API and report problems: unknown classes passed to Instance.new, classes that cannot be created, unknown services, unknown enums and enum items, typos in property names, and deprecated functions. Every diagnostic carries a line, a column, and a suggested fix. Accepts a model file (every script inside it is checked), a directory, or a single .lua/.luau file. Use this to review generated or edited code before running it.',
+      'Statically analyse Luau source against the real Roblox API and report problems: unknown classes passed to Instance.new, classes that cannot be created, unknown services, unknown enums and enum items, typos in property names, and deprecated functions. Every diagnostic carries a line, a column, and a suggested fix. Given a model or project it also resolves require() chains and WaitForChild() targets against the real tree, finding missing modules, require cycles, and children the place does not contain. Accepts a model file, a .project.json, a directory, or a single .lua/.luau file. Use this to review generated or edited code before running it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -215,6 +215,9 @@ export const tools = [
       if (args.includeRequires !== false) {
         graph = buildRequireGraph(scripts, roots);
         diagnostics.push(...graph.diagnostics);
+        // `WaitForChild("X")` where the place has no X: only checkable with the
+        // tree in hand, which is why it lives here rather than in the analyser.
+        diagnostics.push(...checkTreeBindings(scripts, roots).diagnostics);
       }
       const result = summarizeScripts(diagnostics, { scripts: scripts.length });
       return {

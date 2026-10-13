@@ -17,7 +17,7 @@ import {
 } from './rbx/validate.js';
 import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
-import { buildRequireGraph, scriptsInModel } from './luau/requires.js';
+import { buildRequireGraph, checkTreeBindings, scriptsInModel } from './luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
 
 const VERSION = '0.1.0';
@@ -541,9 +541,11 @@ export async function run(argv = process.argv.slice(2)) {
           const { diagnostics: found } = analyzeSource(script.source, { file: script.path });
           diagnostics.push(...found);
         }
-        // With the tree in hand, requires can be resolved for real.
+        // With the tree in hand, requires can be resolved for real, and so can
+        // `WaitForChild` targets.
         const graph = buildRequireGraph(scripts, roots);
         diagnostics.push(...graph.diagnostics.filter((d) => d.code !== 'dynamic-require'));
+        diagnostics.push(...checkTreeBindings(scripts, roots).diagnostics);
         const notes = graph.diagnostics.filter((d) => d.code === 'dynamic-require');
         const result = summarizeScripts(diagnostics, { scripts: scripts.length });
         if (!result.ok) process.exitCode = 1;

@@ -5,7 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tokenize, codeTokens } from '../src/luau/lexer.js';
 import { analyzeSource, summarizeScripts } from '../src/luau/analyze.js';
-import { buildRequireGraph, scriptsInModel, resolveChain, findRequires } from '../src/luau/requires.js';
+import {
+  buildRequireGraph,
+  checkTreeBindings,
+  scriptsInModel,
+  resolveChain,
+  findRequires,
+} from '../src/luau/requires.js';
 import { Instance } from '../src/rbx/instance.js';
 import { local } from '../src/backends/index.js';
 
@@ -599,4 +605,58 @@ test('analysis runs on a built project, scripts and all', () => {
   assert.equal(summary.ok, false);
   assert.equal(summary.errorCount, 2, 'one unknown class plus one missing require');
   assert.ok(diagnostics.every((d) => typeof d.file === 'string' && d.file.length > 0));
+});
+
+// ---------------------------------------------------------------------------
+// WaitForChild targets, resolved against the real tree
+// ---------------------------------------------------------------------------
+
+test('WaitForChild of a child the place does not have is a warning', () => {
+  const roots = place();
+  roots[0].children[0].children.find((c) => c.name === 'Config').set(
+    'Source',
+    'local c = game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Confg")\nreturn c\n',
+  );
+  const found = checkTreeBindings(scriptsInModel(roots), roots).diagnostics;
+  assert.equal(found.length, 1);
+  assert.equal(found[0].code, 'wait-for-child-missing');
+  assert.equal(found[0].severity, 'warning', 'the child may be created at runtime');
+  assert.equal(found[0].line, 1);
+  assert.equal(found[0].file, 'ReplicatedStorage.Shared.Config');
+});
+
+test('WaitForChild of a child that does exist is silent', () => {
+  const roots = place();
+  const source = [
+    'local a = game:GetService("ReplicatedStorage"):WaitForChild("Shared")',
+    'local b = game.ReplicatedStorage.Shared:WaitForChild("Util")',
+    'local c = game.ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config")',
+    'local d = script.Parent:WaitForChild("Util")',
+    'return a, b, c, d',
+  ].join('\n');
+  roots[0].children[0].children.find((c) => c.name === 'Config').set('Source', source);
+  assert.deepEqual(checkTreeBindings(scriptsInModel(roots), roots).diagnostics, []);
+});
+
+test('WaitForChild is never second-guessed on a receiver it cannot resolve', () => {
+  const roots = place();
+  const source = [
+    'local character = somePlayer.Character',
+    'local humanoid = character:WaitForChild("Humanoid")',
+    'local byName = game.ReplicatedStorage:WaitForChild(childName)',
+    'local indexed = modules[1]:WaitForChild("Anything")',
+    'local called = getContainer():WaitForChild("Anything")',
+    'local aliased = game.ReplicatedStorage',
+    'local nested = aliased:WaitForChild("NotThere")',
+  ].join('\n');
+  roots[0].children[0].children.find((c) => c.name === 'Config').set('Source', source);
+  assert.deepEqual(checkTreeBindings(scriptsInModel(roots), roots).diagnostics, []);
+});
+
+test('FindFirstChild returning nil is normal and is not reported', () => {
+  const roots = place();
+  roots[0].children[0].children.find((c) => c.name === 'Config').set(
+    'Source', 'local x = game.ReplicatedStorage.Shared:FindFirstChild("DefinitelyNotThere")\nreturn x\n',
+  );
+  assert.deepEqual(checkTreeBindings(scriptsInModel(roots), roots).diagnostics, []);
 });

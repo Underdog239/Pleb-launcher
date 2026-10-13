@@ -244,13 +244,15 @@ error [unknown-enum-item] ReplicatedStorage.Shared.Rig:8:33: Enum.Material.Concr
 error [not-creatable] ReplicatedStorage.Shared.Rig:11:30: Instance.new("Workspace"): this class cannot be created; the engine provides it
   did you mean: game:GetService("Workspace")?
   use game:GetService("Workspace") instead
-warning [deprecated-global] ServerScriptService.Main:4:1: wait() is deprecated
+warning [deprecated-global] ServerScriptService.Main:5:1: wait() is deprecated
   did you mean: task.wait?
   wait is deprecated and throttles differently
-warning [deprecated-method] ServerScriptService.Main:5:6: :Remove() is deprecated
+warning [deprecated-method] ServerScriptService.Main:6:6: :Remove() is deprecated
   did you mean: Destroy?
   Remove only unparents the instance and leaves connections alive
-FAILED: 2 script(s), 2 error(s), 3 warning(s)
+warning [wait-for-child-missing] ServerScriptService.Main:3:76: game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Cnofig"): no child named "Cnofig" in ReplicatedStorage.Shared
+  warning rather than error: the child may be created at runtime
+FAILED: 2 script(s), 2 error(s), 4 warning(s)
 ```
 
 `examples/analysis/` is that project, committed, so the output above is
@@ -264,7 +266,16 @@ error and `0` when there are only warnings, so it drops straight into CI.
 | `unknown-enum`, `unknown-enum-item` | `Enum.Material.Concree` |
 | `property-typo` | a property that does not exist, when a near miss does |
 | `deprecated-global`, `deprecated-method` | `wait()`, `spawn()`, `part:Remove()`, with the modern call |
+| `wait-for-child-missing` | `WaitForChild("X")` on a receiver this place really has, with no child `X` |
 | `syntax-error` | an unterminated string, comment, or long bracket |
+
+The last three need the tree, so they only fire for a model or project, not for a
+loose file. `WaitForChild` is checked and `FindFirstChild` is not: waiting for a
+child states that it must exist, while `FindFirstChild` returning nil is the
+normal, intended outcome of `if not child then return end`. It is a warning
+rather than an error because the child may be created at runtime — the receiver
+must resolve to a real instance before anything is said at all, so
+`character:WaitForChild("Humanoid")` on a local is never second-guessed.
 
 A false positive costs more than a missed bug, so the analyser only reports what
 cannot be wrong:

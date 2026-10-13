@@ -46,6 +46,10 @@ function findChildByMethod(inst, part) {
   // the caller asked for a *name* would be a wrong resolution presented as a
   // right one.
   switch (part.name) {
+    // Services live at the top of the tree, so `game:GetService("X")` resolves
+    // exactly when a root named X exists.
+    case 'GetService':
+      return inst.isRoot ? inst.findChild(part.arg) : undefined;
     case 'FindFirstChild':
     case 'WaitForChild':
       return children.find((c) => c.name === part.arg) || null;
@@ -335,6 +339,169 @@ function findCycles(nodes) {
     visit(start);
   }
   return cycles;
+}
+
+/**
+ * Names a script waits for that the place does not contain.
+ *
+ * `WaitForChild("Foo")` is a promise: the script cannot proceed until a child
+ * named Foo exists. If the receiver resolves to a real instance in this place
+ * and no such child is there, that is worth saying — it is one of the most
+ * common bugs in hand-written and machine-written Roblox code alike.
+ *
+ * Two deliberate limits keep this from crying wolf:
+ *
+ *   * Only `WaitForChild` is checked. `FindFirstChild` returning nil is a
+ *     normal, intended outcome — `if not player then return end` is idiomatic —
+ *     so treating it as a fault would be wrong.
+ *   * Only statically resolvable receivers are checked. `character:WaitForChild`
+ *     on a local that came from a player is invisible here, and is left alone.
+ *
+ * The severity is `warning`, not `error`, because the child can legitimately be
+ * created at runtime. The message says so.
+ */
+export function checkTreeBindings(scripts, roots) {
+  const root = new RootView(roots);
+  const diagnostics = [];
+
+  for (const script of scripts) {
+    const { tokens } = codeTokens(script.source);
+    for (let i = 0; i < tokens.length - 5; i++) {
+      const method = tokens[i];
+      if (method.type !== 'ident' || method.value !== 'WaitForChild') continue;
+      if (tokens[i - 1]?.value !== ':') continue;
+      if (tokens[i + 1]?.value !== '(') continue;
+      const arg = tokens[i + 2];
+      if (arg?.type !== 'string') continue;
+
+      // Reconstruct the receiver by walking backwards to the start of the
+      // dotted chain that precedes the `:`.
+      const chain = readReceiverChain(tokens, i - 1);
+      if (!chain) continue;
+      const resolved = resolveChain(chain, { root, scriptInst: script.inst });
+      if (resolved.kind !== 'resolved') continue;
+
+      const target = resolved.instance;
+      const children = target.isRoot ? target.roots : target.children;
+      if (children.some((c) => c.name === arg.value)) continue;
+
+      const suggestion = closestName(arg.value, children.map((c) => c.name));
+      diagnostics.push({
+        severity: 'warning',
+        code: 'wait-for-child-missing',
+        message:
+          `${renderChain(chain)}:WaitForChild(${JSON.stringify(arg.value)}): no child named ` +
+          `${JSON.stringify(arg.value)} in ${target.isRoot ? 'game' : target.getFullName()}`,
+        file: script.path,
+        line: method.line,
+        col: method.col,
+        actual: arg.value,
+        ...(suggestion ? { suggestion } : {}),
+        hint: 'warning rather than error: the child may be created at runtime',
+      });
+    }
+  }
+
+  diagnostics.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+  return { diagnostics, scriptCount: scripts.length };
+}
+
+/**
+ * Read the expression before a `:` as a static chain, or null when it is not
+ * one.
+ *
+ * Walks backwards over the shapes code actually uses:
+ *
+ *   game                          a bare root
+ *   game.ReplicatedStorage.Shared a dotted path
+ *   game:GetService("Players")    a call whose result is navigated further
+ *   script.Parent:FindFirstChild("X")
+ *
+ * Anything else — a local alias, an index, an arithmetic expression — returns
+ * null so the caller stays quiet rather than resolving the wrong thing.
+ */
+function readReceiverChain(tokens, colonIndex) {
+  const parts = [];
+  let i = colonIndex - 1;
+
+  for (;;) {
+    // A call result: `...:Method("literal")`.
+    if (tokens[i]?.value === ')') {
+      const open = matchOpenParen(tokens, i);
+      if (open === -1) return null;
+      const methodTok = tokens[open - 1];
+      const receiverColon = tokens[open - 2];
+      const argTok = tokens[open + 1];
+      const closesRight = tokens[open + 2]?.value === ')';
+      if (
+        !methodTok ||
+        methodTok.type !== 'ident' ||
+        receiverColon?.value !== ':' ||
+        argTok?.type !== 'string' ||
+        !closesRight
+      ) {
+        return null;
+      }
+      parts.unshift({ name: methodTok.value, arg: argTok.value, token: methodTok });
+      i = open - 3;
+      continue;
+    }
+
+    if (tokens[i]?.type !== 'ident' && tokens[i]?.type !== 'keyword') return null;
+    parts.unshift({ name: tokens[i].value, token: tokens[i] });
+    i -= 1;
+
+    while (tokens[i]?.value === '.') {
+      const nameTok = tokens[i - 1];
+      if (!nameTok || (nameTok.type !== 'ident' && nameTok.type !== 'keyword')) return null;
+      parts.unshift({ name: nameTok.value, token: nameTok });
+      i -= 2;
+    }
+
+    if (i < 0) return parts;
+    if (tokens[i]?.value === ':') {
+      i -= 1;
+      continue;
+    }
+    // The chain must begin where an expression can begin. If it is preceded by
+    // anything else, it is part of a larger expression we cannot follow -- and
+    // following it anyway would resolve the wrong receiver.
+    return CHAIN_BOUNDARIES.has(tokens[i]?.value) ? parts : null;
+  }
+}
+
+/**
+ * Tokens a navigable chain may start right after. Anything else means the
+ * expression continues to the left, so the chain is not the whole receiver.
+ */
+const CHAIN_BOUNDARIES = new Set([
+  '=',
+  '(',
+  ',',
+  '{',
+  ';',
+  'local',
+  'return',
+  'then',
+  'do',
+  'and',
+  'or',
+  'not',
+  '[',
+]);
+
+/** Index of the `(` matching the `)` at `closeIndex`, or -1. */
+function matchOpenParen(tokens, closeIndex) {
+  let depth = 0;
+  for (let i = closeIndex; i >= 0; i--) {
+    const v = tokens[i].value;
+    if (v === ')') depth++;
+    else if (v === '(') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
 }
 
 /** Collect every script in a model, with its path and source. */
