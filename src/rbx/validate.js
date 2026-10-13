@@ -24,21 +24,31 @@ function diag(severity, code, message, extra = {}) {
 
 // --- suggestions ------------------------------------------------------------
 
-/** Levenshtein distance with an early exit once it cannot be a good match. */
+/**
+ * Damerau-Levenshtein (optimal string alignment) distance, with an early exit
+ * once a match cannot be good enough.
+ *
+ * Transposition counts as one edit, which is what a typed-in-the-wrong-order
+ * mistake is: `--dpeth` must suggest `--depth`, not `--path`.
+ */
 function editDistance(a, b) {
   const m = a.length;
   const n = b.length;
   if (Math.abs(m - n) > 3) return 99;
+  let prevPrev = [];
   let prev = Array.from({ length: n + 1 }, (_, i) => i);
   for (let i = 1; i <= m; i++) {
     const cur = [i];
     for (let j = 1; j <= n; j++) {
-      cur[j] = Math.min(
-        prev[j] + 1,
-        cur[j - 1] + 1,
-        prev[j - 1] + (a[i - 1].toLowerCase() === b[j - 1].toLowerCase() ? 0 : 1),
-      );
+      const cost = a[i - 1].toLowerCase() === b[j - 1].toLowerCase() ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1) {
+        const aSwapped = a[i - 1].toLowerCase() === b[j - 2].toLowerCase();
+        const bSwapped = a[i - 2].toLowerCase() === b[j - 1].toLowerCase();
+        if (aSwapped && bSwapped) cur[j] = Math.min(cur[j], prevPrev[j - 2] + 1);
+      }
     }
+    prevPrev = prev;
     prev = cur;
   }
   return prev[n];
@@ -88,7 +98,11 @@ export { describe };
  */
 export function validateValue(value, info, path) {
   const out = [];
-  const type = info.valueType;
+  // Validate against the type an author *writes*, not the type the file stores.
+  // BasePart.Color is a Color3 in the API but is persisted as a Color3uint8, so
+  // checking `valueType` alone would skip the 0..1 range check and let a
+  // [255, 0, 0] "red" be silently clamped on write.
+  const type = info.canonicalType || info.valueType || info.type;
   const bad = (expected) =>
     out.push(
       diag(ERROR, 'invalid-value', `${path} expected ${expected}, got ${describe(value)}`, {
@@ -178,21 +192,37 @@ export function validateValue(value, info, path) {
       }
       break;
     }
-    case 'Color3':
-      if (isVec(value, ['r', 'g', 'b'])) {
-        for (const k of ['r', 'g', 'b']) {
-          if (value[k] < 0 || value[k] > 1) {
-            out.push(
-              diag(WARNING, 'color-out-of-range', `${path}.${k} = ${value[k]} is outside 0..1`, {
-                path: `${path}.${k}`,
-                expected: '0..1',
-                actual: value[k],
-              }),
-            );
-          }
+    case 'Color3': {
+      // Color3 channels are 0..1 fractions. A 0..255 byte value is a common
+      // agent mistake (and the on-disk Color3uint8 representation), so it gets
+      // an explicit note rather than a bare range complaint.
+      const keys = isVec(value, ['r', 'g', 'b']) ? ['r', 'g', 'b'] : null;
+      const indices = !keys && isArr(value, 3) ? [0, 1, 2] : null;
+      if (!keys && !indices) {
+        bad('{r, g, b} or [r, g, b] in 0..1');
+        break;
+      }
+      for (const k of keys || indices) {
+        const channel = value[k];
+        if (channel < 0 || channel > 1) {
+          const byteLike = channel > 1 && channel <= 255;
+          out.push(
+            diag(WARNING, 'color-out-of-range', `${path}.${k} = ${channel} is outside 0..1`, {
+              path: `${path}.${k}`,
+              expected: '0..1',
+              actual: channel,
+              ...(byteLike
+                ? {
+                    note: 'Color3 channels are 0..1 fractions; a 0..255 channel is clamped when written',
+                    suggestion: `${(channel / 255).toFixed(4)} (${channel}/255)`,
+                  }
+                : { note: 'Color3 channels are 0..1 fractions' }),
+            }),
+          );
         }
-      } else if (!isArr(value, 3)) bad('{r, g, b} or [r, g, b] in 0..1');
+      }
       break;
+    }
     case 'Color3uint8':
       if (!(isVec(value, ['r', 'g', 'b']) || isArr(value, 3))) bad('{r, g, b} or [r, g, b]');
       break;
@@ -331,13 +361,22 @@ export function validateModel(roots, options = {}) {
   };
   for (const root of roots) visit(root);
 
+  return summarizeDiagnostics(diagnostics, { instanceCount, strict: options.strict });
+}
+
+/**
+ * Wrap a diagnostic list in the standard result shape (counts + `ok`).
+ *
+ * The write path and the script-edit path produce the same diagnostic objects
+ * as the validator, so they report the same way — one shape for an agent to
+ * parse, wherever the problem came from.
+ */
+export function summarizeDiagnostics(diagnostics, { instanceCount = 0, strict = false } = {}) {
   const errors = diagnostics.filter((d) => d.severity === ERROR);
   const warnings = diagnostics.filter((d) => d.severity === WARNING);
-  const ok = options.strict ? errors.length === 0 && warnings.length === 0 : errors.length === 0;
-
   return {
-    ok,
-    strict: !!options.strict,
+    ok: strict ? errors.length === 0 && warnings.length === 0 : errors.length === 0,
+    strict: !!strict,
     instanceCount,
     errorCount: errors.length,
     warningCount: warnings.length,

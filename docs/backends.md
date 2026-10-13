@@ -49,6 +49,18 @@ because it *is* the engine.
   settings, or set `ROBLOX_STUDIO_MCP_PATH`.
 - A GUI session. Studio's CLI still launches the application.
 
+**Two ways to use it**
+
+- `--backend studio` routes the individual commands (`exec`, `api dump`) to
+  Studio directly.
+- `studio proxy` (or `studio serve --proxy`) hands the *whole* MCP session to
+  Studio's own server over stdio. Nothing is re-encoded and no tool list is
+  mirrored, so every Studio tool — including `multi_edit`, `script_grep` and
+  the playtest subagent — is available as-is. The trade is that Studio's tool
+  list is Studio's; the built-in surface is not available at the same time. On
+  a host without Studio this fails immediately with the reason rather than
+  hanging on a pipe that will never open.
+
 ## `auto`
 
 Default. Picks `studio` when a Studio installation is detected, otherwise

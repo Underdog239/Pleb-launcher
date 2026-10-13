@@ -121,3 +121,61 @@ test('validateValue reports nested CFrame rotation problems', () => {
   assert.equal(diags.length, 1);
   assert.match(diags[0].message, /rotation expected 9 numbers/);
 });
+
+// --- canonical vs serialized types ------------------------------------------
+// BasePart.Color is a Color3 (0..1) in the API but is persisted as Color3uint8.
+// Validating only the on-disk type let a [255, 0, 0] "red" be silently clamped.
+
+test('out-of-range Color3 channels warn even though Color is stored as Color3uint8', () => {
+  // As a spec arrives: coerce() turns [2, 0, 0] into {r, g, b} first.
+  const result = validateModel([part({ Color: coerce([2, 0, 0], 'Color3') })]);
+  const d = result.diagnostics.find((x) => x.code === 'color-out-of-range');
+  assert.ok(d, 'expected color-out-of-range');
+  assert.equal(d.severity, 'warning');
+  assert.equal(d.path, 'P.Color.r');
+  assert.equal(d.actual, 2);
+  // 0..255 values are the common mistake, so they get the fraction spelled out.
+  assert.match(d.note, /0\.\.1 fractions/);
+  assert.equal(d.suggestion, '0.0078 (2/255)');
+});
+
+test('an uncoerced array color is still range-checked', () => {
+  const result = validateModel([part({ Color: [2, 0, 0] })]);
+  const d = result.diagnostics.find((x) => x.code === 'color-out-of-range');
+  assert.ok(d, 'expected color-out-of-range');
+  assert.equal(d.path, 'P.Color.0');
+});
+
+test('a non-color value on Color is still a shape error', () => {
+  const result = validateModel([part({ Color: 'red' })]);
+  assert.ok(codes(result).includes('invalid-value'));
+});
+
+test('a color in 0..1 does not warn', () => {
+  const result = validateModel([part({ Color: [0.6, 0.2, 0.2] })]);
+  assert.equal(result.warningCount, 0);
+});
+
+test('out-of-range colors fail in strict mode', () => {
+  const result = validateModel([part({ Color: [2, 0, 0] })], { strict: true });
+  assert.equal(result.ok, false);
+});
+
+test('coerce does not throw on an unknown enum item', () => {
+  // Throwing here aborted the run and hid every other problem in the model.
+  assert.equal(coerce('Concree', 'Material'), 'Concree');
+  assert.equal(coerce(999, 'Material'), 999);
+});
+
+test('every problem in a model is reported in one pass', () => {
+  const result = validateModel([
+    part({ Sizee: [1, 1, 1], Material: 'Concree', Transparency: 5, Color: [2, 0, 0] }),
+  ]);
+  const seen = codes(result);
+  assert.ok(seen.includes('unknown-property'), 'unknown-property');
+  assert.ok(seen.includes('invalid-enum-item'), 'invalid-enum-item');
+  assert.ok(seen.includes('out-of-range'), 'out-of-range');
+  assert.ok(seen.includes('color-out-of-range'), 'color-out-of-range');
+  assert.equal(result.errorCount, 2);
+  assert.equal(result.warningCount, 2);
+});

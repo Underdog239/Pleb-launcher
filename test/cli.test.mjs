@@ -248,3 +248,64 @@ test('validate_model tool is exposed', () => {
   assert.ok(names.includes('validate_model'));
 });
 
+
+// --- agent-ergonomics: options and diagnostics ------------------------------
+
+test('--output=path is honoured instead of silently writing the default', () => {
+  const spec = path.join(tmp, 'eq-flag.json');
+  fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'P', properties: { Size: [1, 1, 1] } }));
+  const target = path.join(tmp, 'eq-flag.rbxm');
+  const result = cliJson(['model', spec, `--output=${target}`]);
+  assert.equal(result.output, target);
+  assert.ok(fs.existsSync(target));
+});
+
+test('an unknown option is an error with a suggestion, not a positional', () => {
+  const res = cli(['tree', 'whatever.rbxm', '--dpeth', '2']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /unknown option: --dpeth/);
+  assert.match(res.stderr, /did you mean --depth/);
+});
+
+test('an unknown command suggests the closest one', () => {
+  const res = cli(['trees', 'x.rbxm']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /unknown command: trees/);
+  assert.match(res.stderr, /did you mean tree/);
+});
+
+test('a single bad spec reports every problem at once', () => {
+  const spec = path.join(tmp, 'multi-error.json');
+  fs.writeFileSync(
+    spec,
+    JSON.stringify({
+      className: 'Part',
+      name: 'P',
+      properties: { Sizee: [1, 1, 1], Material: 'Concree', Transparency: 5 },
+    }),
+  );
+  const outPath = path.join(tmp, 'multi-error.rbxm');
+  const res = cli(['model', spec, '-o', outPath]);
+
+  assert.equal(res.status, 1);
+  assert.equal(fs.existsSync(outPath), false, 'must not write an invalid model');
+  // Before: the run died on the first enum error and reported nothing else.
+  assert.match(res.stderr, /Sizee .*not a valid property/);
+  assert.match(res.stderr, /did you mean: Size\?/);
+  assert.match(res.stderr, /"Concree" is not a valid Material item/);
+  assert.match(res.stderr, /did you mean: Concrete\?/);
+  assert.match(res.stderr, /Transparency = 5 is outside 0\.\.1/);
+
+  const parsed = JSON.parse(res.stdout);
+  assert.equal(parsed.errorCount, 2);
+  assert.equal(parsed.warningCount, 1);
+});
+
+test('doctor reports what the host can do', () => {
+  const checks = cliJson(['doctor', '--json']);
+  const names = checks.map((c) => c.name);
+  assert.ok(names.includes('node'));
+  assert.ok(names.includes('reflection database'));
+  assert.ok(names.includes('serialization patches'));
+  assert.ok(checks.every((c) => typeof c.ok === 'boolean' && typeof c.detail === 'string'));
+});

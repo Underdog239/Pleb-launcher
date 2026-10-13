@@ -81,6 +81,27 @@ Diagnostics are structured, so an agent can act on them:
 
 `--strict` promotes warnings to failures.
 
+Every problem is reported in one pass — one bad enum item does not hide the
+three other mistakes in the same spec. Ranges are checked against the type you
+*write*, not the type on disk: `Part.Color` is a `Color3` (0..1) in the API and a
+`Color3uint8` in the file, so `"Color": [255, 0, 0]` warns instead of being
+silently clamped to red.
+
+### Searching, diffing and editing scripts
+
+The perception surface goes past reading one script:
+
+```bash
+studio grep game.rbxl 'DataStore' -i        # one line per match, grep-style
+studio grep game.rbxl 'require\(' --json    # path, line, column, text
+studio diff before.rbxm after.rbxm          # what actually changed
+studio edit game.rbxl '[{"path":"ServerScriptService.Main","find":"print(","replace":"warn("}]'
+```
+
+`studio edit` (and the `multi_edit` MCP tool) resolves and checks **every** edit
+before applying any of them, so a typo in one path cannot leave a model
+half-edited. An ambiguous `find` is refused rather than guessed at.
+
 ## Install
 
 Requires Node.js 22.6+ (native ESM, runs directly from source). There are **no
@@ -101,6 +122,8 @@ studio tree game.rbxl --depth 2
 studio inspect game.rbxl Workspace.SpawnLocation
 studio stats game.rbxl
 studio read game.rbxl ServerScriptService.Main
+studio grep game.rbxl 'require\(' --limit 20
+studio doctor
 
 # Author content
 studio model tower.json -o tower.rbxm
@@ -111,6 +134,10 @@ studio validate tower.rbxm
 # Perceive it
 studio view tower.rbxm -o tower.svg
 studio view tower.rbxm --format json
+studio diff before.rbxm after.rbxm
+
+# Change it
+studio edit game.rbxl '[{"path":"ServerScriptService.Main","find":"print(","replace":"warn("}]'
 
 # Full-fidelity execution (needs Studio)
 studio exec smokeTest.luau --place game.rbxl --backend studio
@@ -119,6 +146,32 @@ studio api dump -o api.json --backend studio
 # Drive the MCP surface directly
 studio tools
 studio call create_model '{"spec":{"className":"Part","name":"P"},"output":"p.rbxm"}'
+```
+
+### Options, typos and capability checks
+
+Options take a value as `--output x` or `--output=x`. An unknown option or
+command is an **error**, never a stray positional argument — silently ignoring
+`--output=tower.rbxm` and writing `out.rbxm` is the same class of bug as a
+silently dropped property:
+
+```bash
+studio model tower.json --ouptut=tower.rbxm
+# error: unknown option: --ouptut — did you mean --output?
+studio trees game.rbxl
+# error: unknown command: trees — did you mean tree?
+```
+
+MCP tool names get the same treatment. `studio doctor` answers "what can this
+host actually do?" before an agent discovers the limits by failing:
+
+```bash
+studio doctor
+# ok    node: v22.22.3
+# ok    reflection database: 935 classes, 648 enums
+# ok    serialization patches: BasePart.Size -> size, BasePart.Color -> Color3uint8
+# ok    mcp tools: 15 exposed
+# ok    roblox studio: not installed (local backend only — no engine Luau; no MCP server)
 ```
 
 ### Authoring spec
@@ -159,10 +212,17 @@ item names and vectors accept arrays:
 ```bash
 studio serve                 # JSON-RPC 2.0 over stdio
 studio serve --backend local
+studio proxy                 # hand the session to Studio's own MCP server
 ```
 
 Point any MCP client at it. Both newline-delimited JSON and LSP-style
-`Content-Length` framing are accepted.
+`Content-Length` framing are accepted, and **replies use the framing the client
+sent** — a framed client cannot parse a newline-delimited reply.
+
+`studio proxy` (or `studio serve --proxy`) is a byte pipe to Studio's built-in
+MCP server when it is available, so you keep Studio's real `execute_luau` and
+playtest tools without keeping a tool list in sync. It needs Studio; the local
+backend has no engine to proxy to and says so.
 
 Tools exposed (names mirror Studio's own MCP server where they overlap):
 
@@ -172,12 +232,15 @@ Tools exposed (names mirror Studio's own MCP server where they overlap):
 | `search_game_tree` | yes | yes | hierarchy as JSON |
 | `inspect_instance` | yes | yes | every property + serialization info |
 | `script_read` | yes | yes | script source |
+| `script_grep` | yes | yes | text/regex search across all scripts |
 | `model_stats` | yes | yes | counts by class |
 | `create_model` | yes | yes | JSON spec -> `.rbxm`/`.rbxmx` |
 | `build` | yes | yes | Rojo-style project -> place |
 | `convert` | yes | yes | binary <-> XML |
 | `validate_model` | yes | yes | structured diagnostics + suggestions |
 | `view_scene` | yes | yes | approximate SVG / JSON |
+| `diff_models` | yes | yes | what changed between two models |
+| `multi_edit` | yes | yes | edit script sources, all-or-nothing |
 | `execute_luau` | no | yes | real engine, command-bar permission |
 | `api_dump` | no | yes | Studio's API surface |
 
@@ -245,8 +308,8 @@ node scripts/gen-patches.mjs        # needs network
 ## Tests
 
 ```bash
-npm test          # 52 tests: LZ4, binary codec, XML codec, reflection,
-                  # validation, CLI, MCP
+npm test          # 98 tests: LZ4, binary codec, XML codec, reflection,
+                  # validation, CLI, MCP, script search/diff/edit
 ```
 
 ## Verification against the reference implementation

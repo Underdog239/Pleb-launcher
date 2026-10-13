@@ -9,13 +9,31 @@ import fs from 'node:fs';
 import { resolveBackend, listBackends, local } from '../backends/index.js';
 import { loadModel, saveModel, formatFor } from '../rbx/io.js';
 import { viewSvg, sceneSummary } from '../backends/local/view.js';
-import { Instance } from '../rbx/instance.js';
-import { validateModel, formatDiagnostics } from '../rbx/validate.js';
+import { validateModel, formatDiagnostics, summarizeDiagnostics, closestName } from '../rbx/validate.js';
 
+/**
+ * Load the model a tool was pointed at.
+ *
+ * There is deliberately no default: fabricating an empty `Workspace` here would
+ * make a tool call with a typo'd or missing `file` look like it succeeded on an
+ * empty place, which is exactly the silent-wrong-answer failure this project
+ * exists to avoid.
+ */
 function loadRoots(file) {
-  if (!file) return [new Instance('Folder', 'Workspace')];
+  if (!file || typeof file !== 'string') {
+    throw new Error(
+      'missing "file": pass the path to a .rbxm/.rbxl/.rbxmx/.rbxlx model or place file',
+    );
+  }
   return loadModel(file);
 }
+
+const FILE_PROP = {
+  file: {
+    type: 'string',
+    description: 'Path to a .rbxm/.rbxl (binary) or .rbxmx/.rbxlx (XML) model or place file',
+  },
+};
 
 export const tools = [
   {
@@ -35,10 +53,11 @@ export const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        file: { type: 'string', description: 'Path to a .rbxm/.rbxl/.rbxmx/.rbxlx file' },
+        ...FILE_PROP,
         path: { type: 'string', description: 'Dot path to start from, e.g. "Workspace.Model"' },
         depth: { type: 'integer', description: 'Maximum depth to expand' },
       },
+      required: ['file'],
     },
     handler: (args) => local.tree(loadRoots(args.file), { path: args.path || '', depth: args.depth ?? null }),
   },
@@ -49,10 +68,10 @@ export const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        file: { type: 'string' },
+        ...FILE_PROP,
         path: { type: 'string', description: 'Dot path, e.g. "Workspace.Part"' },
       },
-      required: ['path'],
+      required: ['file', 'path'],
     },
     handler: (args) => local.inspect(loadRoots(args.file), args.path),
   },
@@ -61,15 +80,15 @@ export const tools = [
     description: 'Read a script instance source. Mirrors Studio MCP script_read.',
     inputSchema: {
       type: 'object',
-      properties: { file: { type: 'string' }, path: { type: 'string' } },
-      required: ['path'],
+      properties: { ...FILE_PROP, path: { type: 'string', description: 'Dot path of the script' } },
+      required: ['file', 'path'],
     },
     handler: (args) => local.readScript(loadRoots(args.file), args.path),
   },
   {
     name: 'model_stats',
     description: 'Summarise a model: total instance count and a breakdown by class.',
-    inputSchema: { type: 'object', properties: { file: { type: 'string' } } },
+    inputSchema: { type: 'object', properties: { ...FILE_PROP }, required: ['file'] },
     handler: (args) => local.stats(loadRoots(args.file)),
   },
   {
@@ -168,11 +187,12 @@ export const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        file: { type: 'string' },
+        ...FILE_PROP,
         format: { type: 'string', enum: ['svg', 'json'] },
         output: { type: 'string', description: 'Optional path to write the SVG to' },
         plane: { type: 'string', enum: ['xz', 'xy', 'zy'] },
       },
+      required: ['file'],
     },
     handler: (args) => {
       const roots = loadRoots(args.file);
@@ -228,7 +248,92 @@ export const tools = [
     },
   },
 
-  // @@TOOLS2@@
+  {
+    name: 'script_grep',
+    description:
+      'Search the source of every script in a model for a text or regex pattern. Mirrors Studio MCP script_grep, but reads a model file instead of a live DataModel. Returns each match with its instance path, line and column.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...FILE_PROP,
+        pattern: { type: 'string', description: 'RegExp source, or literal text when fixed=true' },
+        path: { type: 'string', description: 'Restrict the search to a subtree, e.g. "ServerScriptService"' },
+        fixed: { type: 'boolean', description: 'Treat pattern as literal text, not a regex' },
+        ignoreCase: { type: 'boolean' },
+        limit: { type: 'integer', description: 'Maximum matches returned (default 200)' },
+      },
+      required: ['file', 'pattern'],
+    },
+    handler: (args) =>
+      local.scriptGrep(loadRoots(args.file), args.pattern, {
+        fixed: !!args.fixed,
+        ignoreCase: !!args.ignoreCase,
+        path: args.path,
+        limit: args.limit,
+      }),
+  },
+  {
+    name: 'diff_models',
+    description:
+      'Compare two models structurally and report what was added, removed and changed (per property). Use this to verify an edit did what you intended.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        before: { type: 'string', description: 'Path to the original model file' },
+        after: { type: 'string', description: 'Path to the edited model file' },
+      },
+      required: ['before', 'after'],
+    },
+    handler: (args) => local.diffModels(loadModel(args.before), loadModel(args.after)),
+  },
+  {
+    name: 'multi_edit',
+    description:
+      'Edit script sources in a model: replace a whole script with "source", or a snippet with "find"/"replace". Mirrors Studio MCP multi_edit. Every edit is resolved and checked before any is applied, so a bad path cannot leave the model half-edited. Writes to "output" (default: the input file) only if nothing errored.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        input: { type: 'string', description: 'Path to the model file to edit' },
+        output: { type: 'string', description: 'Where to write the result (default: overwrite input)' },
+        edits: {
+          type: 'array',
+          description: 'One entry per script: { path, source } or { path, find, replace, all }',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Dot path of the script, e.g. "ServerScriptService.Main"' },
+              source: { type: 'string', description: 'Replacement source for the whole script' },
+              find: { type: 'string', description: 'Snippet to replace' },
+              replace: { type: 'string', description: 'Replacement for find' },
+              all: { type: 'boolean', description: 'Replace every occurrence of find' },
+            },
+            required: ['path'],
+          },
+        },
+        force: { type: 'boolean', description: 'Apply the edits that are valid even if others failed' },
+      },
+      required: ['input', 'edits'],
+    },
+    handler: (args) => {
+      const roots = loadModel(args.input);
+      const edits = local.applyScriptEdits(roots, args.edits, { force: !!args.force });
+      if (!edits.ok && !args.force) {
+        // Refuse to write a half-applied edit set; surface every problem at once.
+        throw new Error(formatDiagnostics(summarizeDiagnostics(edits.diagnostics)));
+      }
+      const validation = validateModel(roots);
+      if (!validation.ok) throw new Error(formatDiagnostics(validation));
+      const output = args.output || args.input;
+      const bytes = saveModel(output, roots);
+      return {
+        output,
+        bytes,
+        edits: edits.files,
+        skipped: edits.diagnostics,
+        validation,
+      };
+    },
+  },
 ];
 
 export function findTool(name) {
@@ -242,7 +347,14 @@ export function toolList() {
 /** Execute a tool by name against the resolved backend. */
 export async function callTool(name, args, { backend = 'auto' } = {}) {
   const tool = findTool(name);
-  if (!tool) throw new Error(`unknown tool: ${name}`);
+  if (!tool) {
+    // Same contract as the validator: never just say "no", say what you meant.
+    const suggestion = closestName(String(name), tools.map((t) => t.name));
+    throw new Error(
+      `unknown tool: ${name}${suggestion ? ` — did you mean ${suggestion}?` : ''} ` +
+        `(available: ${tools.map((t) => t.name).join(', ')})`,
+    );
+  }
   const ctx = { backend: resolveBackend(backend), backendName: backend };
   return tool.handler(args || {}, ctx);
 }
