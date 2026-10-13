@@ -1,0 +1,19 @@
+{
+  "name": "studio-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Roblox Studio as a CLI + MCP server for agents, with pluggable local/Studio backends.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "bin": {
+    "studio": "./bin/studio.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "mcp": "node bin/studio.js serve",
+    "gen:reflection": "node scripts/gen-reflection.mjs"
+  }
+}
