@@ -108,7 +108,7 @@ export const tools = [
     handler: (args) => {
       const spec = args.spec || JSON.parse(fs.readFileSync(args.specFile, 'utf8'));
       const roots = local.modelFromSpec(spec);
-      const validation = validateModel(roots, { strict: !!args.strict });
+      const validation = validateModel(roots, { strict: !!args.strict, format: formatFor(args.output) });
       if (!validation.ok) {
         // Refuse to write a model we know is wrong; surface the diagnostics.
         throw new Error(formatDiagnostics(validation));
@@ -135,11 +135,18 @@ export const tools = [
       required: ['project', 'output'],
     },
     handler: (args) => {
-      const { roots, projectName } = local.buildFromProject(args.project);
-      const validation = validateModel(roots, { strict: !!args.strict });
+      const { roots, projectName, warnings } = local.buildFromProject(args.project);
+      const validation = validateModel(roots, { strict: !!args.strict, format: formatFor(args.output) });
       if (!validation.ok) throw new Error(formatDiagnostics(validation));
       const bytes = saveModel(args.output, roots);
-      return { output: args.output, bytes, projectName, stats: local.stats(roots), validation };
+      return {
+        output: args.output,
+        bytes,
+        projectName,
+        stats: local.stats(roots),
+        validation,
+        ...(warnings && warnings.length ? { projectWarnings: warnings } : {}),
+      };
     },
   },
   {
@@ -151,12 +158,16 @@ export const tools = [
       properties: {
         file: { type: 'string', description: 'Path to a model file to validate' },
         spec: { type: 'object', description: 'Instance spec to validate instead of a file' },
+        format: { type: 'string', enum: ['binary', 'xml'], description: 'Target format to check write coverage against' },
         strict: { type: 'boolean', description: 'Treat warnings as failures' },
       },
     },
     handler: (args) => {
       const roots = args.spec ? local.modelFromSpec(args.spec) : loadRoots(args.file);
-      const result = validateModel(roots, { strict: !!args.strict });
+      // Without an explicit target, check the file's own format; an inline spec
+      // has no destination yet, so the strictest format is assumed.
+      const format = args.format || (args.file ? formatFor(args.file) : 'binary');
+      const result = validateModel(roots, { strict: !!args.strict, format });
       return { ...result, summary: formatDiagnostics(result) };
     },
   },
@@ -321,9 +332,9 @@ export const tools = [
         // Refuse to write a half-applied edit set; surface every problem at once.
         throw new Error(formatDiagnostics(summarizeDiagnostics(edits.diagnostics)));
       }
-      const validation = validateModel(roots);
-      if (!validation.ok) throw new Error(formatDiagnostics(validation));
       const output = args.output || args.input;
+      const validation = validateModel(roots, { format: formatFor(output) });
+      if (!validation.ok) throw new Error(formatDiagnostics(validation));
       const bytes = saveModel(output, roots);
       return {
         output,

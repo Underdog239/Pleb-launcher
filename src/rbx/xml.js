@@ -6,7 +6,7 @@
 import { XmlElement, parseXml, serializeXml as toXmlString } from '../util/xml.js';
 import { Instance } from './instance.js';
 import { isEnumValueType, serializationFor, enumValue } from './reflection.js';
-import { IDENTITY_ROTATION } from './datatypes.js';
+import { IDENTITY_ROTATION, isDefaultish } from './datatypes.js';
 
 const ELEM = {
   bool: 'bool',
@@ -16,6 +16,8 @@ const ELEM = {
   double: 'double',
   string: 'string',
   BinaryString: 'BinaryString',
+  ContentId: 'ContentId',
+  ProtectedString: 'ProtectedString',
   Content: 'Content',
   Vector2: 'Vector2',
   Vector3: 'Vector3',
@@ -43,6 +45,43 @@ const ELEM = {
 
 const num = (v) => (typeof v === 'number' ? v : 0);
 
+/**
+ * Roblox's Faces bitmask, in the enum's declaration order.
+ * Right=1, Top=2, Back=4, Left=8, Bottom=16, Front=32.
+ */
+const FACES = { Right: 1, Top: 2, Back: 4, Left: 8, Bottom: 16, Front: 32 };
+
+/** Axes bitmask: X=1, Y=2, Z=4. */
+const AXES = { X: 1, Y: 2, Z: 4 };
+
+const bitOf = (value, bit) => (((num(value) | 0) & bit) !== 0 ? 'true' : 'false');
+
+/**
+ * Value types this codec writes faithfully, as `<Tag name="...">`.
+ *
+ * Anything outside this set is either dropped or written in a form Studio will
+ * not read back, so the writer reports it instead of guessing. Keeping the list
+ * explicit (rather than inferring it from the switch below) is what lets the
+ * validator warn *before* a file is written; `test/xml-types.test.mjs` proves
+ * every entry here actually round-trips.
+ */
+export const xmlValueTypes = new Set([
+  'bool', 'int', 'int64', 'float', 'double', 'string',
+  'BinaryString', 'ContentId', 'ProtectedString', 'Content',
+  'Vector2', 'Vector3', 'Vector3int16', 'CFrame',
+  'Color3', 'Color3uint8', 'UDim', 'UDim2',
+  'Ray', 'Faces', 'Axes', 'BrickColor',
+  'NumberSequence', 'ColorSequence', 'NumberRange', 'Rect',
+  'PhysicalProperties', 'Font', 'Instance',
+  // SharedString is deliberately absent: rbx_xml stores it in a shared string
+  // table we have not verified, so it is reported rather than guessed at.
+]);
+
+/** Can this value type be written to .rbxmx/.rbxlx without losing information? */
+export function xmlSupports(valueType) {
+  return xmlValueTypes.has(valueType);
+}
+
 function sub(name, text) {
   const el = new XmlElement(name);
   el.text = text === undefined || text === null ? '' : String(text);
@@ -67,9 +106,19 @@ function encodeVec3(name, v) {
   return el;
 }
 
-/** Build the property element for one property. */
-function encodeProperty(serializedName, valueType, value, ctx) {
-  const enumType = isEnumValueType(valueType);
+/**
+ * Build the property element for one property.
+ *
+ * `record` is false when the property is not set on the instance: the codec
+ * still writes a default for it (existing behaviour), but a type it cannot
+ * represent is only worth reporting if somebody actually set it.
+ */
+function encodeProperty(serializedName, valueType, value, ctx, record = true, isEnum = null) {
+  const report = (suffix) => {
+    if (record) ctx?.unsupported?.add(`${serializedName}:${suffix}`);
+  };
+  // Prefer the caller's resolved answer; fall back to the name for direct calls.
+  const enumType = isEnum === null ? isEnumValueType(valueType) : isEnum;
   const tag = enumType ? 'token' : ELEM[valueType] || 'string';
   const el = new XmlElement(tag, { name: serializedName });
 
@@ -173,13 +222,14 @@ function encodeProperty(serializedName, valueType, value, ctx) {
         encodeVec3('direction', value && value.direction),
       );
       break;
+    // Faces and Axes are bitmasks whose bits follow the enum's declaration
+    // order. This used to write `false` for every child regardless of the
+    // value, so a part with the top face on came back with no faces at all.
     case 'Faces':
-      for (const f of ['Top', 'Bottom', 'Left', 'Right', 'Front', 'Back']) {
-        el.children.push(sub(f, 'false'));
-      }
+      for (const [name, bit] of Object.entries(FACES)) el.children.push(sub(name, bitOf(value, bit)));
       break;
     case 'Axes':
-      for (const a of ['X', 'Y', 'Z']) el.children.push(sub(a, 'false'));
+      for (const [name, bit] of Object.entries(AXES)) el.children.push(sub(name, bitOf(value, bit)));
       break;
     case 'BrickColor':
       el.text = String(Math.round(num(value)));
@@ -236,10 +286,21 @@ function encodeProperty(serializedName, valueType, value, ctx) {
       break;
     case 'SecurityCapabilities':
     case 'UniqueId':
-      // rbx_xml uses a fixed-width textual form we do not model; skip.
+      // rbx_xml uses a fixed-width textual form we have not verified, so we
+      // refuse rather than invent one. Reporting beats a plausible-looking
+      // wrong value, which is the whole point of this project.
+      report(valueType);
       return null;
 
+    case 'ContentId':
+    case 'ProtectedString':
+      el.text = value == null ? '' : String(value);
+      break;
+
     default:
+      // An unrecognised type would be stringified into a value Studio cannot
+      // read back. Say so instead of writing it.
+      report(valueType);
       el.text = value == null ? '' : String(value);
   }
   return el;
@@ -260,8 +321,9 @@ function named(el, name) {
   return el;
 }
 
-function decodeProperty(el, valueType, ctx) {
-  if (isEnumValueType(valueType)) {
+function decodeProperty(el, valueType, ctx, isEnum = null) {
+  const enumType = isEnum === null ? isEnumValueType(valueType) : isEnum;
+  if (enumType) {
     const raw = textOf(el);
     const asNumber = raw === '' ? NaN : Number(raw);
     if (Number.isFinite(asNumber)) return asNumber;
@@ -327,16 +389,12 @@ function decodeProperty(el, valueType, ctx) {
     }
     case 'Faces': {
       let bits = 0;
-      ['Top', 'Bottom', 'Left', 'Right', 'Front', 'Back'].forEach((n, i) => {
-        if (boolOf(el.find(n))) bits |= 1 << i;
-      });
+      for (const [name, bit] of Object.entries(FACES)) if (boolOf(el.find(name))) bits |= bit;
       return bits;
     }
     case 'Axes': {
       let bits = 0;
-      ['X', 'Y', 'Z'].forEach((n, i) => {
-        if (boolOf(el.find(n))) bits |= 1 << i;
-      });
+      for (const [name, bit] of Object.entries(AXES)) if (boolOf(el.find(name))) bits |= bit;
       return bits;
     }
     case 'BrickColor':
@@ -425,7 +483,9 @@ export function deserializeXml(text) {
       const rev = ser.reverse.get(propName);
       const canonical = rev ? rev.canonicalName : propName;
       const valueType = rev ? rev.valueType : ELEM_REVERSE[propEl.name] || 'string';
-      const value = decodeProperty(propEl, valueType, { byReferent });
+      // The stored name alone cannot tell an enum from a datatype of the same
+      // name, so pass the reflection layer's answer through.
+      const value = decodeProperty(propEl, valueType, { byReferent }, rev ? rev.isEnum : null);
       if (canonical === 'Name') inst.name = String(value);
       else inst.props.set(canonical, value);
     }
@@ -445,7 +505,7 @@ export function serializeXml(roots, options = {}) {
 
   const referent = new Map();
   all.forEach((inst, i) => referent.set(inst, i));
-  const ctx = { referent };
+  const ctx = { referent, unsupported: new Set() };
 
   const root = new XmlElement('roblox', {
     'xmlns:xmime': 'http://www.w3.org/2005/05/xmlmime',
@@ -464,8 +524,15 @@ export function serializeXml(roots, options = {}) {
 
     const ser = serializationFor(inst.className);
     for (const canonical of [...ser.forward.keys()].filter((n) => n !== 'Name').sort()) {
-      const { serializedName, valueType } = ser.forward.get(canonical);
-      const propEl = encodeProperty(serializedName, valueType, inst.props.get(canonical), ctx);
+      const { serializedName, valueType, isEnum } = ser.forward.get(canonical);
+      const propEl = encodeProperty(
+        serializedName,
+        valueType,
+        inst.props.get(canonical),
+        ctx,
+        !isDefaultish(inst.props.get(canonical)),
+        isEnum,
+      );
       if (propEl) propsEl.children.push(propEl);
     }
 
@@ -475,6 +542,17 @@ export function serializeXml(roots, options = {}) {
   };
 
   for (const r of roots) root.children.push(build(r));
+
+  // Mirror the binary writer: a property that could not be written faithfully
+  // is reported, never lost in silence.
+  if (ctx.unsupported.size > 0) {
+    const dropped = [...ctx.unsupported].sort();
+    if (options.onUnsupported) options.onUnsupported(dropped);
+    if (options.strictUnsupported) {
+      throw new Error(`rbx: ${dropped.length} property/properties have no faithful XML form: ${dropped.join(', ')}`);
+    }
+  }
+
   // rbx_xml (and Rojo) omit the XML declaration; some readers sniff on it.
   return toXmlString(root, { declaration: false, ...options });
 }

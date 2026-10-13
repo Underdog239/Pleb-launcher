@@ -147,10 +147,13 @@ const nums = (v, n) => Array.isArray(v) && v.length === n && v.every(isNum);
  * validator untouched, which reports it once, with the full path and a
  * did-you-mean — instead of aborting on the first problem and hiding the rest.
  */
-export function coerce(value, valueType) {
+export function coerce(value, valueType, isEnum = null) {
   if (value === null || value === undefined) return value;
 
-  if (isEnumValueType(valueType)) {
+  // `isEnum` is resolved by the reflection layer so a datatype that shares a
+  // name with an enum (Font) is not mistaken for one.
+  const enumType = isEnum === null ? isEnumValueType(valueType) : isEnum;
+  if (enumType) {
     if (typeof value === 'number') return value;
     const v = enumValue(valueType, String(value));
     return v === undefined ? value : v;
@@ -199,6 +202,37 @@ export function coerce(value, valueType) {
       if (nums(value, 2)) return { min: value[0], max: value[1] };
       if (value && isNum(value.min) && isNum(value.max)) return value;
       return value;
+    case 'Font': {
+      // The Font datatype. Rojo's implicit form is [family, weight, style];
+      // rbx-dom's explicit form is an object.
+      if (Array.isArray(value) && typeof value[0] === 'string') {
+        return { family: value[0], weight: isNum(value[1]) ? value[1] : 400, style: isNum(value[2]) ? value[2] : 0 };
+      }
+      if (value && typeof value.family === 'string') {
+        return {
+          family: value.family,
+          weight: isNum(value.weight) ? value.weight : 400,
+          style: isNum(value.style) ? value.style : 0,
+          cachedFaceId: typeof value.cachedFaceId === 'string' ? value.cachedFaceId : '',
+        };
+      }
+      return value;
+    }
+    case 'Faces':
+    case 'Axes':
+      // A bitmask, or an array of face/axis names.
+      if (Array.isArray(value)) {
+        const names = valueType === 'Faces'
+          ? ['Right', 'Top', 'Back', 'Left', 'Bottom', 'Front']
+          : ['X', 'Y', 'Z'];
+        let bits = 0;
+        for (const name of value) {
+          const i = names.indexOf(String(name));
+          if (i !== -1) bits |= 1 << i;
+        }
+        return bits;
+      }
+      return value;
     case 'Rect':
       if (nums(value, 4)) return { min: v2(value[0], value[1]), max: v2(value[2], value[3]) };
       return value;
@@ -220,6 +254,11 @@ export function authoringType(info) {
   return info.canonicalType || info.valueType;
 }
 
+/** Coerce against a property's reflection info, respecting its enum-ness. */
+function coerceForProperty(raw, info) {
+  return coerce(raw, authoringType(info), info ? info.isEnum ?? null : null);
+}
+
 /** Build instances from a JSON spec: { className, name, properties, children }. */
 export function modelFromSpec(spec) {
   const list = Array.isArray(spec) ? spec : [spec];
@@ -232,7 +271,7 @@ function buildSpecNode(node) {
   const inst = new Instance(className, node.name || className);
   const ser = serializationFor(className);
   for (const [prop, raw] of Object.entries(node.properties || node.$properties || {})) {
-    inst.set(prop, coerce(raw, authoringType(ser.forward.get(prop))));
+    inst.set(prop, coerceForProperty(raw, ser.forward.get(prop)));
   }
   for (const child of node.children || []) inst.addChild(buildSpecNode(child));
   return inst;
@@ -261,68 +300,303 @@ function scriptNameFor(baseName) {
   return baseName.replace(/\.(server|client)?\.?(lua|luau)$/i, '');
 }
 
-/** Build instances from a Rojo-style project tree. */
+/** Extensions this builder can turn into instances. */
+const MODEL_EXTS = new Set(['.rbxm', '.rbxmx', '.rbxl', '.rbxlx']);
+const META_EXTS = new Set(['.meta.json', '.model.json']);
+const SOURCE_EXTS = new Set(['.lua', '.luau']);
+
+/**
+ * Files that are part of a project but have no instance representation here.
+ * Rojo treats `.txt`/`.csv` as StringValue; `.json`/`.toml`/`.yaml` as
+ * ModuleScript. Anything else is reported rather than dropped.
+ */
+const DATA_EXTS = new Map([
+  ['.txt', 'StringValue'],
+  ['.csv', 'StringValue'],
+]);
+
+const isMetaFileName = (name) => {
+  const lower = name.toLowerCase();
+  return lower.endsWith('.meta.json') || lower.endsWith('.model.json');
+};
+
+const isModelFile = (name) => MODEL_EXTS.has(path.extname(name).toLowerCase());
+
+/**
+ * Coerce a `$properties` entry, accepting both Rojo's implicit form
+ * (`"Vector3": [1, 2, 3]`) and rbx-dom's explicit form
+ * (`{ "Type": "Vector3", "Value": [1, 2, 3] }`, or `{ "Vector3": [1,2,3] }`).
+ *
+ * Explicit form matters because it is how Rojo lets you set a property whose
+ * type it would otherwise have to guess -- and how exotic types get set at all.
+ */
+export function coerceProperty(raw, info) {
+  const type = authoringType(info);
+  const enumKind = info ? info.isEnum ?? null : null;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && !(raw instanceof Uint8Array)) {
+    if (typeof raw.Type === 'string' && 'Value' in raw) {
+      return coerce(raw.Value, raw.Type === 'Enum' && typeof raw.Value === 'string' ? type : raw.Type, raw.Type === 'Enum' ? true : enumKind);
+    }
+    // rbx-dom also accepts { TypeName: value } with no Type/Value pair.
+    const keys = Object.keys(raw);
+    if (keys.length === 1 && keys[0] !== 'Type' && keys[0] !== 'Value' && keys[0].includes('.')) {
+      return coerce(raw[keys[0]], keys[0], enumKind);
+    }
+  }
+  return coerce(raw, type, enumKind);
+}
+
+/** Read a `.meta.json` (or `init.meta.json`) file, or null when absent. */
+function readMetaFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  // Rojo accepts both the flat form and a { Properties: {...}, ... } wrapper.
+  return parsed && typeof parsed === 'object' ? parsed : {};
+}
+
+/**
+ * Apply `.meta.json` contents to an instance: `Properties` plus the
+ * rbx-dom-style flat form where unknown keys are properties.
+ */
+function applyMeta(inst, meta, warnings) {
+  if (!meta) return;
+  const ser = serializationFor(inst.className);
+  const props = meta.Properties || meta.properties || {};
+  for (const [prop, raw] of Object.entries(props)) {
+    // `className` selects the class; it is not a property assignment.
+    if (prop === 'className' || prop === 'ClassName') continue;
+    inst.set(prop, coerceProperty(raw, ser.forward.get(prop)));
+  }
+
+  // Attributes and Tags live in BinaryString columns this codec does not model.
+  // Saying so beats writing a project that loses them.
+  const attributes = meta.Attributes || meta.attributes;
+  if (attributes && Object.keys(attributes).length > 0) {
+    warnings.push({
+      code: 'unsupported-attributes',
+      message: `${inst.getFullName()}: Attributes are not representable (no AttributesSerialize column)`,
+      path: inst.getFullName(),
+    });
+  }
+  const tags = meta.Tags || meta.tags;
+  if (Array.isArray(tags) && tags.length > 0) {
+    warnings.push({
+      code: 'unsupported-tags',
+      message: `${inst.getFullName()}: Tags are not representable (no Tags column)`,
+      path: inst.getFullName(),
+    });
+  }
+}
+
+/**
+ * Build instances from a Rojo-style project tree.
+ *
+ * Supports the parts of the Rojo project format that survive a static build:
+ * `$className`, `$path`, `$properties`, `$ignoreUnknownInstances`, nested
+ * directories, `init.lua`/`init.luau`, `.meta.json`/`init.meta.json`, `.model.json`,
+ * `.rbxm`/`.rbxmx`/`.rbxl`/`.rbxlx` model files, and explicit (`{Type, Value}`)
+ * property values.
+ *
+ * @returns {{roots: Instance[], projectName: string|null, warnings: object[]}}
+ */
 export function buildFromProject(projectPath) {
   const abs = path.resolve(projectPath);
   const project = JSON.parse(fs.readFileSync(abs, 'utf8'));
   const baseDir = path.dirname(abs);
   const treeSpec = project.tree || project;
-  const roots = Object.entries(treeSpec).map(([key, spec]) => buildProjectNode(key, spec, baseDir));
-  return { roots, projectName: project.name || null };
+  const warnings = [];
+  const roots = Object.entries(treeSpec)
+    .filter(([key]) => !key.startsWith('$'))
+    .map(([key, spec]) => buildProjectNode(key, spec, baseDir, warnings));
+  return { roots, projectName: project.name || null, warnings };
 }
 
-function buildProjectNode(nodeName, spec, baseDir) {
+/** Load every root instance stored in a model file. */
+function loadModelFile(filePath) {
+  return loadModel(filePath);
+}
+
+/** Which class a directory's `init.<script>` implies. */
+function classFromInitScript(fileName) {
+  return scriptClassFor(fileName);
+}
+
+/** A className declared in a meta file, if any (Rojo accepts both spellings). */
+function metaClassName(meta) {
+  if (!meta) return null;
+  return meta.className || meta.ClassName || null;
+}
+
+function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = null) {
   if (spec === null || typeof spec !== 'object') {
     throw new Error(`invalid project node: ${nodeName}`);
   }
   let target = null;
   let targetIsDir = false;
-  if (spec.$path) {
+  if (spec.$path !== undefined) {
     target = path.resolve(baseDir, spec.$path);
+    if (!fs.existsSync(target)) {
+      throw new Error(`${nodeName}: $path does not exist: ${spec.$path}`);
+    }
     targetIsDir = fs.statSync(target).isDirectory();
   }
 
-  let className = spec.$className || 'Folder';
-  if (target && !targetIsDir && !spec.$className) {
-    const cls = scriptClassFor(path.basename(target));
-    if (cls) className = cls;
+  // A model file contributes its own instances.
+  const modelTarget = target && !targetIsDir && isModelFile(target) ? target : null;
+
+  // --- resolve the class before creating the instance -----------------------
+  // Order matters and matches Rojo: an explicit $className wins, then a
+  // className in the meta file, then the naming convention (`init.server.luau`
+  // -> Script), and only then the default. A directory holding an init script
+  // is that script, not a Folder that happens to carry source.
+  let className = spec.$className || null;
+  let initScriptPath = null;
+  let dirMeta = null;
+
+  if (targetIsDir) {
+    dirMeta = readMetaFile(path.join(target, 'init.meta.json')) || readMetaFile(path.join(target, 'init.model.json'));
+    for (const entry of fs.readdirSync(target)) {
+      if (entry.toLowerCase().startsWith('init.') && SOURCE_EXTS.has(path.extname(entry).toLowerCase())) {
+        initScriptPath = path.join(target, entry);
+        break;
+      }
+    }
+    if (!className) {
+      className = metaClassName(dirMeta) || (initScriptPath ? classFromInitScript(path.basename(initScriptPath)) : null) || 'Folder';
+    }
+  } else if (!className && target && !targetIsDir && !modelTarget) {
+    className = scriptClassFor(path.basename(target)) || null;
   }
+  if (!className) className = modelTarget ? 'Model' : 'Folder';
 
   const inst = new Instance(className, nodeName);
   const ser = serializationFor(className);
 
-  for (const [prop, raw] of Object.entries(spec.$properties || {})) {
-    inst.set(prop, coerce(raw, authoringType(ser.forward.get(prop))));
+  if (targetIsDir) {
+    if (initScriptPath) {
+      // Only a script class can hold Source; a Folder with an init.lua is a
+      // project mistake worth naming rather than writing an invalid property.
+      if (inst.isA('LuaSourceContainer')) {
+        inst.set('Source', fs.readFileSync(initScriptPath, 'utf8'));
+      } else {
+        warnings.push({
+          code: 'init-script-ignored',
+          message: `${nodeName}: ${path.basename(initScriptPath)} ignored because $className is ${className}`,
+          path: nodeName,
+        });
+      }
+    }
+
+    const entries = fs.readdirSync(target).sort();
+    for (const entry of entries) {
+      const childPath = path.join(target, entry);
+      if (fs.statSync(childPath).isDirectory()) {
+        inst.addChild(buildProjectNode(entry, { $path: childPath }, baseDir, warnings));
+        continue;
+      }
+      if (entry.toLowerCase().startsWith('init.') && SOURCE_EXTS.has(path.extname(entry).toLowerCase())) continue;
+      if (entry.startsWith('init.meta.') || entry === 'init.model.json') continue;
+
+      if (entry.endsWith('.meta.json')) {
+        const owner = entry.slice(0, -'.meta.json'.length);
+        // The owner is `Foo` for Foo.meta.json, but the file it describes is
+        // Foo.luau (the instance is named "Foo", not "Foo.luau").
+        const hasOwner = entries.some(
+          (other) =>
+            other === owner ||
+            (SOURCE_EXTS.has(path.extname(other).toLowerCase()) && scriptNameFor(other) === owner) ||
+            (DATA_EXTS.has(path.extname(other).toLowerCase()) &&
+              other.slice(0, other.length - path.extname(other).length) === owner),
+        );
+        if (!hasOwner) {
+          warnings.push({
+            code: 'orphan-meta',
+            message: `${path.relative(baseDir, childPath)} has no matching instance named "${owner}"`,
+            path: path.relative(baseDir, childPath),
+          });
+        }
+        continue;
+      }
+      if (entry.endsWith('.model.json')) continue;
+
+      const cls = scriptClassFor(entry);
+      if (cls) {
+        const child = new Instance(cls, scriptNameFor(entry));
+        child.set('Source', fs.readFileSync(childPath, 'utf8'));
+        applyMeta(child, readMetaFile(childPath.replace(/\.(lua|luau)$/i, '.meta.json')), warnings);
+        inst.addChild(child);
+        continue;
+      }
+      if (isModelFile(entry)) {
+        for (const loaded of loadModelFile(childPath)) inst.addChild(loaded);
+        continue;
+      }
+      const dataClass = DATA_EXTS.get(path.extname(entry).toLowerCase());
+      if (dataClass) {
+        const child = new Instance(dataClass, entry.slice(0, entry.length - path.extname(entry).length));
+        child.set('Value', fs.readFileSync(childPath, 'utf8'));
+        inst.addChild(child);
+        continue;
+      }
+      warnings.push({
+        code: 'skipped-file',
+        message: `${path.relative(baseDir, childPath)} maps to no instance (unknown extension)`,
+        path: path.relative(baseDir, childPath),
+      });
+    }
+  } else if (modelTarget) {
+    const loaded = loadModelFile(modelTarget);
+    if (loaded.length === 1 && !spec.$className) {
+      // Rojo semantics: `$path` to a single-root model file *is* that instance.
+      const only = loaded[0];
+      inst.className = only.className;
+      inst.name = nodeName;
+      for (const [k, v] of only.props) inst.set(k, v);
+      for (const c of [...only.children]) inst.addChild(c);
+    } else {
+      for (const loadedInst of loaded) inst.addChild(loadedInst);
+    }
+  } else if (target) {
+    const cls = scriptClassFor(path.basename(target));
+    if (cls) {
+      inst.className = cls;
+      inst.set('Source', fs.readFileSync(target, 'utf8'));
+      applyMeta(inst, readMetaFile(target.replace(/\.(lua|luau)$/i, '.meta.json')), warnings);
+    } else {
+      const dataClass = DATA_EXTS.get(path.extname(target).toLowerCase());
+      if (dataClass) {
+        inst.className = dataClass;
+        inst.set('Value', fs.readFileSync(target, 'utf8'));
+      } else {
+        warnings.push({
+          code: 'skipped-file',
+          message: `${spec.$path} maps to no instance (unknown extension)`,
+          path: spec.$path,
+        });
+      }
+    }
   }
 
-  if (target) {
-    if (targetIsDir) {
-      for (const entry of fs.readdirSync(target).sort()) {
-        const childPath = path.join(target, entry);
-        if (fs.statSync(childPath).isDirectory()) {
-          inst.addChild(buildProjectNode(entry, { $className: 'Folder', $path: childPath }, baseDir));
-        } else if (entry.startsWith('init.')) {
-          inst.set('Source', fs.readFileSync(childPath, 'utf8'));
-        } else {
-          const cls = scriptClassFor(entry);
-          if (cls) {
-            const child = new Instance(cls, scriptNameFor(entry));
-            child.set('Source', fs.readFileSync(childPath, 'utf8'));
-            inst.addChild(child);
-          }
-        }
-      }
-    } else {
-      const cls = scriptClassFor(path.basename(target));
-      if (cls) inst.set('Source', fs.readFileSync(target, 'utf8'));
-    }
+  // Properties are applied *after* any content loaded from disk, so the project
+  // file always wins over a vendored model: an explicit $properties entry is a
+  // stronger statement of intent than whatever the model file happened to hold.
+  for (const [prop, raw] of Object.entries(spec.$properties || {})) {
+    inst.set(prop, coerceProperty(raw, ser.forward.get(prop)));
+  }
+  applyMeta(inst, inheritedMeta, warnings);
+  applyMeta(inst, dirMeta, warnings);
+  if (modelTarget) {
+    applyMeta(inst, readMetaFile(modelTarget.replace(/\.(rbxm|rbxmx|rbxl|rbxlx)$/i, '.model.json')), warnings);
   }
 
   for (const [key, child] of Object.entries(spec)) {
     if (key.startsWith('$')) continue;
-    inst.addChild(buildProjectNode(key, child, baseDir));
+    inst.addChild(buildProjectNode(key, child, baseDir, warnings));
   }
 
+  // $ignoreUnknownInstances only affects live sync, where pre-existing
+  // instances might otherwise be deleted. A static build has none, so accepting
+  // the key is the entire job.
   return inst;
 }
 

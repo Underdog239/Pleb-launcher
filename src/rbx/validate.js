@@ -14,6 +14,9 @@ import {
   db,
 } from './reflection.js';
 import { Instance } from './instance.js';
+import { isBinarySerializable } from './types.js';
+import { isDefaultish } from './datatypes.js';
+import { xmlSupports } from './xml.js';
 
 export const ERROR = 'error';
 export const WARNING = 'warning';
@@ -56,10 +59,13 @@ function editDistance(a, b) {
 
 /** Best matching candidate for a misspelled name, or null. */
 export function closestName(name, candidates) {
+  const needle = String(name);
   let best = null;
   let bestScore = 3;
   for (const candidate of candidates) {
-    const d = editDistance(String(name), candidate);
+    // Suggesting the name that was just rejected teaches nothing.
+    if (candidate === needle) continue;
+    const d = editDistance(needle, candidate);
     if (d < bestScore) {
       bestScore = d;
       best = candidate;
@@ -88,7 +94,7 @@ function describe(value) {
   return `${typeof value} ${JSON.stringify(value)}`;
 }
 
-export { describe };
+export { describe, isDefaultish };
 
 // --- value validation -------------------------------------------------------
 
@@ -114,7 +120,8 @@ export function validateValue(value, info, path) {
 
   if (value === null || value === undefined) return out;
 
-  if (isEnumValueType(type)) {
+  const enumType = info.isEnum === undefined ? isEnumValueType(type) : info.isEnum;
+  if (enumType) {
     const items = enumItems(type);
     if (typeof value === 'number') {
       // 0 is the engine default/unset sentinel for enum properties, so it is
@@ -274,6 +281,37 @@ export function validateValue(value, info, path) {
 }
 
 
+// --- format coverage --------------------------------------------------------
+
+/**
+ * Can this property be written to the target format without losing it?
+ *
+ * The binary writer omits a property whose value type it has no encoding for,
+ * and the XML writer stringifies types it does not model. Either way the source
+ * of truth is the codec, not this table — so the check is delegated.
+ *
+ * @param {{valueType: string, canonicalType?: string}} info
+ * @param {'binary'|'xml'|null} format
+ */
+export function formatSupports(info, format) {
+  const stored = info.valueType || info.canonicalType;
+  if (info.isEnum === undefined ? isEnumValueType(stored) : info.isEnum) return true;
+  if (format === 'xml') return xmlSupports(stored);
+  // Binary is the strictest and the default output, so it is what an
+  // unspecified format is checked against.
+  return isBinarySerializable(stored);
+}
+
+/** The formats that cannot represent a property, for a diagnostic message. */
+function unsupportedFormats(info) {
+  const stored = info.valueType || info.canonicalType;
+  if (info.isEnum === undefined ? isEnumValueType(stored) : info.isEnum) return [];
+  const out = [];
+  if (!isBinarySerializable(stored)) out.push('binary');
+  if (!xmlSupports(stored)) out.push('xml');
+  return out;
+}
+
 // --- instance / model validation -------------------------------------------
 
 const RANGES = {
@@ -282,9 +320,10 @@ const RANGES = {
 };
 
 /** Validate every property and structural rule of one instance. */
-export function validateInstance(inst) {
+export function validateInstance(inst, options = {}) {
   const out = [];
   const path = inst.getFullName();
+  const format = options.format || null;
 
   if (!hasClass(inst.className)) {
     out.push(
@@ -300,20 +339,63 @@ export function validateInstance(inst) {
   const ser = serializationFor(inst.className);
   const known = knownPropertyNames(inst.className);
 
+  const declared = allPropertiesFor(inst.className);
+
   for (const [prop, value] of inst.props) {
     const info = ser.forward.get(prop);
     if (!info) {
-      out.push(
-        diag(ERROR, 'unknown-property', `${inst.className}.${prop} is not a valid property of ${inst.className}`, {
-          path: `${path}.${prop}`,
-          actual: prop,
-          suggestion: closestName(prop, known),
-        }),
-      );
+      // Distinguish a typo from a real property the engine simply never saves.
+      // Both are fatal to the write, but they need different fixes: rename the
+      // property, or stop expecting it to persist.
+      if (declared.has(prop)) {
+        out.push(
+          diag(
+            ERROR,
+            'unserializable-property',
+            `${inst.className}.${prop} exists but is not saved to model files, so it would be dropped`,
+            {
+              path: `${path}.${prop}`,
+              actual: prop,
+              note: 'the API marks this property as runtime-only (canSave = false)',
+            },
+          ),
+        );
+      } else {
+        out.push(
+          diag(ERROR, 'unknown-property', `${inst.className}.${prop} is not a valid property of ${inst.className}`, {
+            path: `${path}.${prop}`,
+            actual: prop,
+            suggestion: closestName(prop, known),
+          }),
+        );
+      }
       continue;
     }
 
     out.push(...validateValue(value, info, `${path}.${prop}`));
+
+    // A property the writer cannot represent is a silent loss, which is the
+    // failure this module exists to prevent: an agent sets it, the write
+    // "succeeds", and the file disagrees with the intent.
+    if (!isDefaultish(value) && !formatSupports(info, format)) {
+      const formats = unsupportedFormats(info);
+      out.push(
+        diag(
+          ERROR,
+          'unsupported-type',
+          `${path}.${prop} has type ${info.valueType}, which the ` +
+            `${format ? `${format} ` : ''}writer cannot represent` +
+            `${formats.length ? ` (no ${formats.join(' or ')} encoding)` : ''}` +
+            `; it would be dropped from the output`,
+          {
+            path: `${path}.${prop}`,
+            actual: info.valueType,
+            expected: 'a value type the target format supports',
+            note: 'the property is set but would not survive a write',
+          },
+        ),
+      );
+    }
 
     const range = RANGES[prop];
     if (range && typeof value === 'number' && (value < range[0] || value > range[1])) {
@@ -356,12 +438,14 @@ export function validateModel(roots, options = {}) {
   let instanceCount = 0;
   const visit = (inst) => {
     instanceCount++;
-    diagnostics.push(...validateInstance(inst));
+    diagnostics.push(...validateInstance(inst, options));
     for (const child of inst.children) visit(child);
   };
   for (const root of roots) visit(root);
 
-  return summarizeDiagnostics(diagnostics, { instanceCount, strict: options.strict });
+  const result = summarizeDiagnostics(diagnostics, { instanceCount, strict: options.strict });
+  if (options.format) result.format = options.format;
+  return result;
 }
 
 /**

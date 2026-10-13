@@ -54,16 +54,66 @@ export function allPropertiesFor(className) {
   for (const name of superChain(className).reverse()) {
     const info = classInfo(name);
     if (!info) continue;
-    for (const [prop, [type, canLoad, canSave, refClass]] of Object.entries(info.props)) {
+    for (const [prop, entry] of Object.entries(info.props)) {
+      const [type, canLoad, canSave, refClass] = entry;
+      // `category` is the API dump's own kind for the value type. Newer
+      // reflection.json files record it as a 5th slot; older ones do not.
+      const category = entry[4] || null;
       merged.set(prop, {
         type,
         canLoad: canLoad === 1,
         canSave: canSave === 1,
         refClass: refClass || null,
+        category,
+        declaredOn: name,
       });
     }
   }
   return merged;
+}
+
+/**
+ * Properties typed `Font` that are the *datatype* (family/weight/style), not the
+ * legacy `Font` enum.
+ *
+ * The API dump gives both the same name, so a refactor of the reflection
+ * database could conflate them and the codec would silently write `0` for a
+ * font. The dump's `Category` is the real discriminator and is recorded when
+ * present (`scripts/gen-reflection.mjs`); this list is the fallback for
+ * reflection.json files generated before that, pinned by a test.
+ */
+const FONT_DATATYPE_PROPERTIES = new Set([
+  'GetTextBoundsParams.Font',
+  'ScreenshotHud.OverlayFont',
+]);
+
+function isFontDatatype(className, propName) {
+  return (
+    propName.endsWith('FontFace') ||
+    propName === 'OverlayFont' ||
+    className === 'GetTextBoundsParams' ||
+    FONT_DATATYPE_PROPERTIES.has(`${className}.${propName}`)
+  );
+}
+
+/**
+ * Is this property an enum on the wire, or a structured datatype?
+ *
+ * `isEnumValueType` alone is wrong whenever a datatype shares a name with an
+ * enum, which is exactly the `Font` case: `TextLabel.Font` is the enum while
+ * `TextLabel.FontFace` is the datatype.
+ *
+ * @param {string[]} chain superclass chain, base first
+ * @param {string} propName
+ * @param {string} typeName
+ */
+function resolveIsEnum(chain, propName, typeName) {
+  if (!isEnumValueType(typeName)) return false;
+  if (typeName !== 'Font') return true;
+  for (const cls of chain) {
+    if (isFontDatatype(cls, propName)) return false;
+  }
+  return true;
 }
 
 /** Only properties the engine actually persists to model files. */
@@ -145,6 +195,7 @@ export function serializationFor(className) {
     if (patches[c]) Object.assign(patch, patches[c]);
   }
 
+  const chain = superChain(className);
   const forward = new Map();
   const reverse = new Map();
   for (const [name, info] of allPropertiesFor(className)) {
@@ -159,14 +210,23 @@ export function serializationFor(className) {
       else valueType = p.as;
     }
     const canonicalType = info.type;
+    // The dump's Category, when the reflection file records it, settles the
+    // enum/datatype question outright; otherwise fall back to the name rule.
+    const isEnum =
+      info.category === 'Enum'
+        ? true
+        : info.category
+          ? false
+          : resolveIsEnum(chain, name, valueType);
     forward.set(name, {
       serializedName,
       valueType,
       canonicalType,
       refClass: info.refClass,
       canLoad: info.canLoad,
+      isEnum,
     });
-    reverse.set(serializedName, { canonicalName: name, valueType, canonicalType });
+    reverse.set(serializedName, { canonicalName: name, valueType, canonicalType, isEnum });
   }
 
   const result = { forward, reverse };

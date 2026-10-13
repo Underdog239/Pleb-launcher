@@ -23,7 +23,7 @@ import {
   serializationFor,
 } from './reflection.js';
 import { Instance } from './instance.js';
-import { rotationFromId, rotationToId, IDENTITY_ROTATION } from './datatypes.js';
+import { rotationFromId, rotationToId, IDENTITY_ROTATION, isDefaultish } from './datatypes.js';
 
 const MAGIC = Uint8Array.from([0x3c, 0x72, 0x6f, 0x62, 0x6c, 0x6f, 0x78, 0x21]); // "<roblox!"
 const SIGNATURE = Uint8Array.from([0x89, 0xff, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -451,10 +451,19 @@ export function serializeModel(roots, options = {}) {
     const ser = serializationFor(className);
     const propNames = [...ser.forward.keys()].filter((n) => n !== 'Name').sort();
     for (const propName of propNames) {
-      const { serializedName, valueType, canonicalType } = ser.forward.get(propName);
-      const binType = binaryTypeFor(valueType, isEnumValueType(valueType) ? 'Enum' : null);
+      const { serializedName, valueType, canonicalType, isEnum } = ser.forward.get(propName);
+      // `isEnum` comes from the reflection layer, which distinguishes an enum
+      // from a datatype of the same name (Font). Guessing here would encode a
+      // font as the integer 0.
+      const binType = binaryTypeFor(valueType, isEnum ? 'Enum' : null);
       if (binType === null) {
-        ctx.unsupported.add(`${className}.${propName}:${valueType}`);
+        // No encoding exists, so this property cannot be written. Record it --
+        // never let it vanish quietly. Only properties actually set on an
+        // instance count: a class merely *declaring* a type we cannot encode
+        // costs nothing if nobody sets it.
+        if (instances.some((i) => i.props.has(propName) && !isDefaultish(i.props.get(propName)))) {
+          ctx.unsupported.add(`${className}.${propName}:${valueType}`);
+        }
         continue;
       }
       const w = new ByteWriter();
@@ -489,6 +498,17 @@ export function serializeModel(roots, options = {}) {
     out.set(p, o);
     o += p.length;
   }
+
+  // Hand back what could not be encoded. The validator catches this before a
+  // write in the normal path; this is the backstop for anything that does not
+  // validate first, so the loss is never invisible.
+  if (ctx.unsupported.size > 0) {
+    const dropped = [...ctx.unsupported].sort();
+    if (options.onUnsupported) options.onUnsupported(dropped);
+    if (options.strictUnsupported) {
+      throw new Error(`rbx: ${dropped.length} property/properties have no binary encoding: ${dropped.join(', ')}`);
+    }
+  }
   return out;
 }
 
@@ -511,7 +531,19 @@ function decodeValues(cr, binType, instances, propName, ctx, valueType = null) {
 
   switch (binType) {
     case Type.String:
-      put(Array.from({ length: n }, () => cr.string()));
+      if (valueType === 'BinaryString') {
+        // BinaryString shares the string type on the wire, but its bytes are
+        // arbitrary: decoding it as UTF-8 replaces anything invalid, so the
+        // bytes are returned verbatim, matching what the XML codec produces.
+        put(
+          Array.from({ length: n }, () => {
+            const len = cr.u32();
+            return cr.bytes(len);
+          }),
+        );
+      } else {
+        put(Array.from({ length: n }, () => cr.string()));
+      }
       break;
     case Type.Bool:
       put(Array.from({ length: n }, () => cr.u8() !== 0));

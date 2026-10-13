@@ -20,20 +20,66 @@ back to `local` otherwise.
 
 ## Why
 
-Rojo is a one-way, declarative mapper: filesystem → DataModel. It does not
-execute anything, does not read state back, and cannot author models
-programmatically. This project fills the rest of the gap:
+Rojo is the standard way to get a Roblox project onto a filesystem, and it is
+very good at it. It is also built around a live Studio session: the plugin does
+the work, and `rojo serve` streams changes into a running engine.
+
+None of that helps an agent (or a CI job) that has a model file and no Studio.
+This project covers that ground:
 
 - **Read + write** model files, in both binary and XML formats.
 - **Author** content from a JSON spec (agents can generate geometry).
-- **Build** Rojo-style projects.
+- **Build** Rojo-style projects — the same project format, offline.
 - **Perceive** a scene as structured JSON, or as an approximate SVG projection.
+- **Search, diff and edit** scripts inside a model without extracting anything.
 - **Execute** Luau with full engine fidelity through Studio when available.
 - **Speak MCP**, so agents talk to it exactly like they talk to Studio's own
   built-in MCP server.
-- **Fail loudly.** Every write is validated first; a bad property or wrong type
-  is rejected with a path, an expectation, and a suggested fix — never silently
-  dropped.
+- **Fail loudly.** Every write is validated first; a bad property, a wrong type,
+  or a value the target format cannot represent is rejected with a path, an
+  expectation, and a suggested fix — never silently dropped.
+
+### How it compares to Rojo
+
+Being honest about this matters more than winning the comparison, because the
+whole point of the project is that nothing fails quietly:
+
+| | Rojo | studio-cli |
+|---|---|---|
+| Live two-way sync with Studio | **yes**, via its plugin | no — not attempted |
+| Studio plugin, VS Code extension, Wally/Aftman | **yes** | no |
+| Years of production hardening | **yes** | no |
+| Works with no Studio, no plugin, no GUI | partly (`build` only) | **yes** |
+| Read/modify an arbitrary `.rbxm` you were handed | no | **yes** |
+| Script search, diff and edit inside a model | no | **yes** |
+| Machine-readable diagnostics for every write | no | **yes** |
+| MCP tool surface | no | **yes** |
+
+It is not a Rojo replacement; it is the offline, agent-facing half. Rojo owns
+the live-sync workflow, and this project deliberately consumes Rojo's ecosystem
+data (the reflection and patch databases come from **rbx-dom**).
+
+### Project format compatibility
+
+`studio build` reads the same project files Rojo does, including the parts that
+only matter for a static build:
+
+- `$className`, `$path`, `$properties`, `$ignoreUnknownInstances`
+- Nested directories, `init.lua` / `init.server.luau` / `init.client.luau`
+- `.meta.json` (per-script and `init.meta.json`, including `className`)
+- `.model.json`, and `.rbxm`/`.rbxmx`/`.rbxl`/`.rbxlx` files referenced by
+  `$path` (a single-root model becomes the node itself, as Rojo does)
+- Explicit rbx-dom property values: `{ "Type": "Vector3", "Value": [1, 2, 3] }`
+- `.txt` / `.csv` as `StringValue`
+
+**Not supported:** `Attributes` and `Tags`. They live in `AttributesSerialize`
+and `Tags` columns this codec does not model, so rather than write a project
+that loses them, the builder reports them by name and continues.
+
+Anything in a project directory that maps to no instance — a stray `.xyz`, a
+`.meta.json` whose owner does not exist, an `init.lua` on a `$className` that
+cannot hold source — is reported as a build warning. None of it is skipped in
+silence.
 
 ## Validation
 
@@ -86,6 +132,22 @@ three other mistakes in the same spec. Ranges are checked against the type you
 *write*, not the type on disk: `Part.Color` is a `Color3` (0..1) in the API and a
 `Color3uint8` in the file, so `"Color": [255, 0, 0]` warns instead of being
 silently clamped to red.
+
+Three failures are distinguished, because they need three different fixes:
+
+| what you wrote | code | what to do |
+|---|---|---|
+| a name that does not exist (`Sizee`) | `unknown-property` | rename it — a did-you-mean is included |
+| a real property the engine never saves (`RobloxLocked`) | `unserializable-property` | stop expecting it to persist |
+| a type the target format cannot represent | `unsupported-type` | write a different format, or drop the property |
+
+That last one used to be a silent drop: the binary writer omitted any property
+whose value type it had no encoding for, and said nothing. Now the check happens
+before the write, against the format you are actually writing, and
+`studio validate <file> --format xml` will tell you what a conversion would lose.
+
+Both writers report the same way, so a property can never leave with the file
+and arrive without it:
 
 ### Searching, diffing and editing scripts
 
@@ -173,6 +235,29 @@ studio doctor
 # ok    mcp tools: 15 exposed
 # ok    roblox studio: not installed (local backend only — no engine Luau; no MCP server)
 ```
+
+```json
+{ "severity": "error", "code": "unsupported-type",
+  "message": "P.UniqueId has type UniqueId, which the xml writer cannot represent (no xml encoding); it would be dropped from the output",
+  "path": "P.UniqueId", "actual": "UniqueId",
+  "note": "the property is set but would not survive a write" }
+```
+
+### What is not representable
+
+Of the 370 value types the API actually uses, **363 are writable to binary and
+361 to XML** (`studio doctor` reports this against your reflection database, so
+it cannot silently rot). The gaps, and why they are gaps:
+
+| types | binary | xml | why |
+|---|---|---|---|
+| `SecurityCapabilities`, `UniqueId` | yes | **no** | rbx_xml uses a fixed-width form we have not verified; refusing beats inventing |
+| `QDir`, `QFont`, `DateTime` | **no** | **no** | Studio plugin settings and capture metadata, not game content |
+| `TweenInfo`, `User`, `Region3int16`, `Path2DControlPoint` | **no** | **no** | never serialized by the engine at all (`canSave = false`) |
+
+None of these fail quietly. A property in one of these types is reported with
+`unsupported-type` before a write, or `unserializable-property` if the engine
+itself would never save it.
 
 ### Authoring spec
 
@@ -308,8 +393,9 @@ node scripts/gen-patches.mjs        # needs network
 ## Tests
 
 ```bash
-npm test          # 98 tests: LZ4, binary codec, XML codec, reflection,
-                  # validation, CLI, MCP, script search/diff/edit
+npm test          # 158 tests: LZ4, binary codec, XML codec, reflection,
+                  # validation, project build, CLI, MCP, script search/diff/edit,
+                  # and a round-trip test per value type in both codecs
 ```
 
 ## Verification against the reference implementation

@@ -36,8 +36,8 @@ function valueTypeOf(member) {
   // Properties typed as a specific class (e.g. Model.PrimaryPart: BasePart)
   // serialize as instance references, but we keep the class name so validation
   // can check that a reference actually points at a legal target.
-  if (vt.Category === 'Class') return { type: 'Instance', refClass: vt.Name };
-  return { type: vt.Name, refClass: null };
+  if (vt.Category === 'Class') return { type: 'Instance', refClass: vt.Name, category: 'Class' };
+  return { type: vt.Name, refClass: null, category: vt.Category || null };
 }
 
 function build(dump) {
@@ -50,11 +50,16 @@ function build(dump) {
       const vt = valueTypeOf(m);
       if (!vt) continue;
       // [valueType, canLoad, canSave, refClass]
+      // The 5th slot records the dump's own Category. It is what distinguishes a
+      // property typed as the legacy `Font` *enum* from one typed as the `Font`
+      // *datatype* -- the two share a name, and without this the codec cannot
+      // tell them apart and writes one of them as 0.
       props[m.Name] = [
         vt.type,
         serialization.CanLoad === false ? 0 : 1,
         serialization.CanSave ? 1 : 0,
         vt.refClass,
+        vt.category || null,
       ];
     }
     const tags = cls.Tags || [];

@@ -79,3 +79,28 @@ export function rotationToId(rotation) {
   }
   return null;
 }
+
+/**
+ * Is this value indistinguishable from "the property was never set"?
+ *
+ * Both codecs write an entry for every serializable property, so reading a file
+ * back materialises defaults for properties nobody chose. Reporting those as
+ * data loss would be noise; a default disappearing loses nothing. A real value
+ * that cannot be written is a genuine loss, and only that is reported.
+ *
+ * Lives here rather than in validate.js so the writers and the validator agree
+ * on the answer without a circular import.
+ */
+export function isDefaultish(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value === 'number') return value === 0;
+  if (typeof value === 'boolean') return value === false;
+  if (typeof value === 'string') return value === '';
+  if (value instanceof Uint8Array) return value.length === 0;
+  if (Array.isArray(value)) return value.every(isDefaultish);
+  if (typeof value === 'object') {
+    const fields = Object.values(value);
+    return fields.length === 0 || fields.every(isDefaultish);
+  }
+  return false;
+}

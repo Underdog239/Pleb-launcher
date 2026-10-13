@@ -7,7 +7,13 @@ import { viewSvg, sceneSummary } from './backends/local/view.js';
 import { runStdioServer } from './mcp/server.js';
 import { proxyStdio } from './mcp/proxy.js';
 import { toolList, callTool } from './mcp/tools.js';
-import { validateModel, formatDiagnostics, summarizeDiagnostics, closestName } from './rbx/validate.js';
+import {
+  validateModel,
+  formatDiagnostics,
+  summarizeDiagnostics,
+  closestName,
+  formatSupports,
+} from './rbx/validate.js';
 import { db, serializationFor } from './rbx/reflection.js';
 
 const VERSION = '0.1.0';
@@ -61,6 +67,26 @@ export function checkEnvironment() {
     checks.push({ name: 'mcp tools', ok: toolList().length > 0, detail: `${toolList().length} exposed` });
   } catch (err) {
     checks.push({ name: 'mcp tools', ok: false, detail: String(err?.message || err) });
+  }
+
+  try {
+    // Coverage of the value types the API actually uses, so a caller knows what
+    // a build can and cannot carry before it loses something.
+    const used = new Map();
+    for (const info of Object.values(db().classes)) {
+      for (const entry of Object.values(info.props)) {
+        used.set(entry[0], (used.get(entry[0]) || 0) + 1);
+      }
+    }
+    const binary = [...used.keys()].filter((t) => formatSupports({ valueType: t }, 'binary')).length;
+    const xml = [...used.keys()].filter((t) => formatSupports({ valueType: t }, 'xml')).length;
+    checks.push({
+      name: 'value type coverage',
+      ok: true,
+      detail: `${binary}/${used.size} binary, ${xml}/${used.size} xml (${used.size} types in use)`,
+    });
+  } catch (err) {
+    checks.push({ name: 'value type coverage', ok: false, detail: String(err?.message || err) });
   }
 
   const studioPath = studio.studioPath();
@@ -326,17 +352,27 @@ export async function run(argv = process.argv.slice(2)) {
         return out(local.stats(loadModel(rest[0])), flags);
 
       case 'build': {
-        const { roots, projectName } = local.buildFromProject(rest[0]);
+        const { roots, projectName, warnings } = local.buildFromProject(rest[0]);
         const target = flags.output || 'out.rbxl';
-        const validation = validateModel(roots, { strict: flags.strict });
+        const validation = validateModel(roots, { strict: flags.strict, format: formatFor(target) });
         if (!validation.ok && !flags.force) {
           process.stderr.write(`${formatDiagnostics(validation)}\n`);
           process.exitCode = 1;
           return out(validation, flags);
         }
         const bytes = saveModel(target, roots);
+        // Files the project references but that map to no instance are reported,
+        // never silently omitted from the place.
+        for (const w of warnings || []) process.stderr.write(`warning: ${w.message}\n`);
         return out(
-          { output: target, bytes, projectName, stats: local.stats(roots), validation },
+          {
+            output: target,
+            bytes,
+            projectName,
+            stats: local.stats(roots),
+            validation,
+            ...(warnings && warnings.length ? { projectWarnings: warnings } : {}),
+          },
           flags,
         );
       }
@@ -345,7 +381,9 @@ export async function run(argv = process.argv.slice(2)) {
         const spec = JSON.parse(fs.readFileSync(flags.spec || rest[0], 'utf8'));
         const target = flags.output || 'out.rbxm';
         const roots = local.modelFromSpec(spec);
-        const validation = validateModel(roots, { strict: flags.strict });
+        // Validate against the format we are about to write, so a property the
+        // target codec cannot represent fails here rather than vanishing.
+        const validation = validateModel(roots, { strict: flags.strict, format: formatFor(target) });
         if (!validation.ok && !flags.force) {
           process.stderr.write(`${formatDiagnostics(validation)}\n`);
           process.exitCode = 1;
@@ -360,22 +398,36 @@ export async function run(argv = process.argv.slice(2)) {
 
       case 'convert': {
         const roots = loadModel(rest[0]);
+        const target = formatFor(rest[1]);
+        // A conversion is exactly where a format gap bites: the source file can
+        // hold something the destination cannot. Report it instead of dropping.
+        const validation = validateModel(roots, { strict: flags.strict, format: target });
+        if (!validation.ok && !flags.force) {
+          process.stderr.write(`${formatDiagnostics(validation)}\n`);
+          process.exitCode = 1;
+          return out(validation, flags);
+        }
         const bytes = saveModel(rest[1], roots);
         return out(
           {
             input: rest[0],
             inputFormat: formatFor(rest[0]),
             output: rest[1],
-            outputFormat: formatFor(rest[1]),
+            outputFormat: target,
             bytes,
+            validation,
           },
           flags,
         );
       }
 
       case 'validate': {
-        const roots = loadModel(rest[0]);
-        const validation = validateModel(roots, { strict: flags.strict });
+        const file = rest[0];
+        const roots = loadModel(file);
+        const validation = validateModel(roots, {
+          strict: flags.strict,
+          format: flags.format === 'binary' || flags.format === 'xml' ? flags.format : formatFor(file),
+        });
         if (!validation.ok) process.exitCode = 1;
         if (flags.json) return out(validation, flags);
         return out(formatDiagnostics(validation), flags);
@@ -459,7 +511,7 @@ export async function run(argv = process.argv.slice(2)) {
           return out(summary, flags);
         }
         const output = flags.output || file;
-        const validation = validateModel(roots);
+        const validation = validateModel(roots, { format: formatFor(output) });
         if (!validation.ok && !flags.force) {
           process.stderr.write(`${formatDiagnostics(validation)}\n`);
           process.exitCode = 1;

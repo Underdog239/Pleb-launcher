@@ -90,6 +90,20 @@ export function binaryTypeFor(valueType, category = null) {
   return VALUE_TYPE_TO_BINARY[valueType] ?? null;
 }
 
+/**
+ * Can a value of this type be written to the binary format at all?
+ *
+ * This exists so a property that would be dropped can be reported *before* the
+ * file is written. A type missing from the table means the binary writer has no
+ * encoding for it; silently omitting it is how a model looks fine and is wrong.
+ */
+export function isBinarySerializable(valueType, category = null) {
+  return binaryTypeFor(valueType, category) !== null;
+}
+
+/** Every value type the binary writer knows how to encode. */
+export const binaryValueTypes = Object.freeze(Object.keys(VALUE_TYPE_TO_BINARY));
+
 /** Zigzag-encode a 32-bit signed int (Roblox's i32 transform). */
 export function transformI32(v) {
   return ((v << 1) ^ (v >> 31)) | 0;
