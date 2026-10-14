@@ -450,6 +450,9 @@ cannot reach that loop — the string exists only once the loop has run — so t
 loop is *run*, over the values it can see, and the accumulator's initialiser is
 replaced with the result.
 
+Worked examples, with the input and the output side by side, are in
+[`docs/deobfuscation.md`](docs/deobfuscation.md).
+
 #### What the detector tells you
 
 `--detect` answers "what is this file, and what can be done about it" without
@@ -518,6 +521,11 @@ is narrow and refuses the cases it does not handle:
 | dead code | an `if` only when the condition folds to a boolean; `while true do ... end` unwrapped only when no `break` or `continue` belongs to it; a numeric `for` that cannot iterate |
 | `loadstring` | only a constant chunk, and only when it does not read a name that is a local anywhere in the file — a compiled chunk does not see the caller's locals |
 | renaming | locals only, never globals, with evidence recorded per rename; `--no-rename` turns it off |
+
+Examples are committed, so every number above is reproducible:
+`examples/obfuscated/Encoded.server.luau` (encoded strings, a byte array, a
+`loadstring`) and `examples/obfuscated/MoonsecShape.server.luau` (base64, a keyed
+XOR, and a VM dispatch loop that is reported rather than attempted).
 
 ```bash
 studio deobfuscate script.luau                 # print the deobfuscated source
