@@ -7,6 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { frameMessage } from '../src/mcp/server.js';
+import { callTool, toolList, findTool } from '../src/mcp/tools.js';
 import { proxyStdio } from '../src/mcp/proxy.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -273,4 +274,81 @@ test('proxy without Studio explains itself instead of hanging', () => {
   const res = spawnSync(process.execPath, [CLI, 'proxy'], { encoding: 'utf8', cwd: tmp, timeout: 30000 });
   assert.equal(res.status, 1);
   assert.match(res.stderr, /proxy needs the studio backend|Studio/i);
+});
+
+// ---------------------------------------------------------------------------
+// execute_luau across both execution backends
+// ---------------------------------------------------------------------------
+
+test('execute_luau explains what is missing instead of failing vaguely', async () => {
+  const previous = process.env.ROBLOX_CLOUD_API_KEY;
+  delete process.env.ROBLOX_CLOUD_API_KEY;
+  delete process.env.RBLX_OC_API_KEY;
+  try {
+    await assert.rejects(() => callTool('execute_luau', { script: 'return 1' }), (err) => {
+      assert.match(err.message, /nowhere to run/);
+      assert.match(err.message, /ROBLOX_CLOUD_API_KEY/);
+      return true;
+    });
+    await assert.rejects(
+      () => callTool('execute_luau', { script: 'return 1', backend: 'opencloud' }),
+      /no Open Cloud API key/,
+    );
+    await assert.rejects(
+      () => callTool('execute_luau', { script: 'return 1', backend: 'studio' }),
+      /not available on this host/,
+    );
+    // Pinned to opencloud with a key but no ids: the message names the ids.
+    process.env.ROBLOX_CLOUD_API_KEY = 'dGVzdC1rZXk=';
+    await assert.rejects(
+      () => callTool('execute_luau', { script: 'return 1', backend: 'opencloud' }),
+      /needs universeId and placeId/,
+    );
+    // No script and no file at all.
+    await assert.rejects(
+      () => callTool('execute_luau', { backend: 'opencloud', universeId: 1, placeId: 2 }),
+      /either scriptFile or script/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ROBLOX_CLOUD_API_KEY;
+    else process.env.ROBLOX_CLOUD_API_KEY = previous;
+  }
+});
+
+test('execute_luau runs on opencloud and returns logs, results and state', async () => {
+  const { startOpenCloudStub } = await import('./fixtures/stub-server.mjs');
+  const stub = await startOpenCloudStub();
+  const previousKey = process.env.ROBLOX_CLOUD_API_KEY;
+  const previousBase = process.env.ROBLOX_CLOUD_BASE_URL;
+  process.env.ROBLOX_CLOUD_API_KEY = 'dGVzdC1rZXk=';
+  process.env.ROBLOX_CLOUD_BASE_URL = stub.baseUrl;
+  try {
+    const out = await callTool('execute_luau', {
+      script: 'return "from the stub"',
+      backend: 'opencloud',
+      universeId: 1,
+      placeId: 2,
+    });
+    assert.equal(out.state, 'COMPLETE');
+    assert.equal(out.backend, 'opencloud');
+    assert.deepEqual(out.results, { ok: true, answer: 42 });
+    assert.match(out.logs, /script was: return "from the stub"/);
+    assert.equal(out.error, null);
+  } finally {
+    if (previousKey === undefined) delete process.env.ROBLOX_CLOUD_API_KEY;
+    else process.env.ROBLOX_CLOUD_API_KEY = previousKey;
+    if (previousBase === undefined) delete process.env.ROBLOX_CLOUD_BASE_URL;
+    else process.env.ROBLOX_CLOUD_BASE_URL = previousBase;
+    await stub.close();
+  }
+});
+
+test('the tool list is stable and every tool still has a schema', () => {
+  const tools = toolList();
+  assert.equal(tools.length, 22);
+  for (const t of tools) {
+    assert.ok(t.name && t.description, `tool ${t.name} needs a name and description`);
+    assert.equal(t.inputSchema.type, 'object');
+  }
+  assert.equal(findTool('execute_luau').inputSchema.properties.backend.enum.join(','), 'studio,opencloud');
 });

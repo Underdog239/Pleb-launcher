@@ -70,23 +70,95 @@ because it *is* the engine.
 
 ## `auto`
 
-Default. Picks `studio` when a Studio installation is detected, otherwise
-`local`. Because the two backends emit the same JSON shapes, an agent's
+Default. Picks `studio` when a Studio installation is detected, then
+`opencloud` when an API key is present, then `local`. Studio comes first because
+it is the engine itself, with physics and a real DataModel; Open Cloud is a real
+server but a constrained one. All three emit the same JSON shapes, so an agent's
 perception code does not change when the backend flips.
 
-## A third backend: Open Cloud
+## `opencloud`
 
-The genuinely headless, high-fidelity path is Roblox's **Open Cloud Luau
-Execution** API. You upload a built place, spawn an execution session task, run
-a Luau entrypoint on Roblox's real servers, then poll for status and fetch logs.
-`roblox/rocale-cli` wraps exactly this (`build -> upload -> run -> logs`).
+Runs Luau on Roblox's own servers, headlessly, with the place loaded. This is
+the only backend that runs the real engine on Linux and in CI, and it is the one
+that closes the loop: build a place locally, check it statically locally, then
+execute it against the real engine from the same shell.
 
-It belongs as a third backend because it is the only option that is:
+```bash
+export ROBLOX_CLOUD_API_KEY=...      # scope: universe.place.luau-execution-session:write
 
-- headless,
-- Linux-friendly,
-- running the real engine,
-- and still unable to render pixels.
+cat > check.luau <<'LUAU'
+local part = Instance.new("Part")
+part.Size = Vector3.new(4, 4, 4)
+print("workspace children:", #workspace:GetChildren())
+return { parts = #workspace:GetDescendants() }
+LUAU
 
-Its costs are an API key, a published universe, and quotas — which is why it is
-not the default.
+studio exec check.luau --backend opencloud --universe 123456 --place-id 987654
+#   42
+studio exec check.luau --backend opencloud --universe 123456 --place-id 987654 --json
+#   {"state":"COMPLETE","backend":"opencloud","placeVersion":12,"logs":"...","results":{"parts":42},...}
+```
+
+`--place-version` pins a specific published version instead of the latest.
+`--poll` and `--timeout` (seconds) tune the polling loop. `--quiet` suppresses
+the progress line and the log passthrough. The script's own `print` output goes
+to stderr so that stdout stays a clean JSON value for a pipeline, and it is
+always included in `--json` output under `logs`, including when the script
+fails — a failed run is exactly when its output matters most.
+
+The same thing is available to an agent through the `execute_luau` MCP tool,
+which takes `backend`, `universeId`, `placeId` and either `scriptFile` or
+`script`.
+
+**Can do**
+
+- Run Luau against the real engine API: `Instance.new`, services, the DataModel,
+  and every property that exists at runtime.
+- Report the script's return values structurally, as JSON, up to 4 MB.
+- Capture logs, up to 450 KB retained per task.
+- Load the place's actual content, so a check can assert against real instances.
+
+**Cannot do**
+
+- Simulate physics, or step time. There is no physics engine in a task.
+- Run the place's own scripts. They are deliberately not started, so a task
+  measures the code it is given and nothing else.
+- Persist changes. Edits to the DataModel are discarded when the task ends;
+  only `SavePlaceAsync` inside the task could write anything back.
+- Render. `render` is `none`.
+- Run for more than 5 minutes, or a script larger than 4 MB.
+
+**Requirements**
+
+- An API key with the `universe.place.luau-execution-session:write` scope, from
+  https://create.roblox.com/dashboard/credentials. Set `ROBLOX_CLOUD_API_KEY`
+  (`RBLX_OC_API_KEY` is accepted too, since that is the name Roblox's own
+  reference client uses).
+- A universe and place id, and a place that has been published at least once.
+- `--universe` and `--place-id`. Note that `--place` is *not* these: with the
+  studio backend `--place` means "the local place file", and the CLI says so
+  rather than guessing if you pass it here.
+
+**Limits, as documented**
+
+Five task creations per minute, 200 status reads per minute, 45 log reads per
+minute, ten incomplete tasks per place. Retained: 450 KB of logs, task metadata
+for 24 hours. All five endpoints are marked stable.
+
+**What is verified, and what is not**
+
+The request shape, the polling loop, the log flattening, the failure paths and
+every error message are tested against a stub server that speaks the same three
+endpoints (`test/opencloud.test.mjs`, `test/fixtures/stub-server.mjs`) — real
+HTTP, real headers, real status codes, no network.
+
+**No live call to Roblox's Open Cloud API has ever been made from this
+repository.** There is no key here and no published place to point at, so the
+live path is unverified. Treat the contract above as documented-and-modelled,
+not observed. If a live call does fail, every failure mode it can reach is
+turned into a sentence that names the cause: see `explainStatus` in
+`src/backends/opencloud/http.js`.
+
+This is the one place where a claim in these docs could most easily be
+overstated, so it is stated the other way: everything is tested except the part
+that needs a Roblox account.

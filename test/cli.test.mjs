@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -25,10 +25,49 @@ function cliJson(args, input) {
   return JSON.parse(res.stdout);
 }
 
-test('backends command lists local and studio', () => {
+/** Like cli(), but with extra environment variables. */
+function cliEnv(args, env, input) {
+  return spawnSync(process.execPath, [CLI, ...args], {
+    encoding: 'utf8',
+    input,
+    cwd: tmp,
+    env: { ...process.env, ...env },
+  });
+}
+
+/**
+ * Start the Open Cloud stub in its own process and hand back its port.
+ *
+ * A separate process is required rather than an in-process server: the CLI is
+ * spawned with spawnSync, which blocks this process's event loop, so a server
+ * living here could never answer the CLI's requests.
+ */
+function startStub(env = {}) {
+  const child = spawn(process.execPath, [path.join(here, 'fixtures', 'opencloud-stub.mjs')], {
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const port = new Promise((resolve, reject) => {
+    let buffered = '';
+    child.stdout.on('data', (chunk) => {
+      buffered += chunk;
+      const line = buffered.split('\n')[0].trim();
+      if (/^\d+$/.test(line)) resolve(Number(line));
+    });
+    child.on('error', reject);
+    child.on('exit', (code) => reject(new Error(`stub exited early with ${code}`)));
+  });
+  return { child, port };
+}
+
+test('backends command lists every backend and its real capabilities', () => {
   const backends = cliJson(['backends']);
-  assert.deepEqual(backends.map((b) => b.name).sort(), ['local', 'studio']);
+  assert.deepEqual(backends.map((b) => b.name).sort(), ['local', 'opencloud', 'studio']);
   assert.equal(backends.find((b) => b.name === 'local').capabilities.executeLuau, false);
+  const oc = backends.find((b) => b.name === 'opencloud');
+  assert.equal(oc.capabilities.executeLuau, true);
+  // Availability is environment-dependent: reported honestly either way.
+  assert.equal(typeof oc.available, 'boolean');
 });
 
 test('model -> tree -> inspect round trip through the CLI', () => {
@@ -562,4 +601,208 @@ test('format_coverage names what cannot be written', () => {
   assert.equal(coverage.xml.covered, 361);
   assert.ok(coverage.binary.uncovered.includes('QDir'));
   assert.ok(!coverage.binary.uncovered.includes('Material'), 'an enum must not be listed as unwritable');
+});
+
+// ---------------------------------------------------------------------------
+// exec --backend opencloud: headless Luau on Roblox's servers
+// ---------------------------------------------------------------------------
+
+test('opencloud exec checks its arguments before sending anything', () => {
+  const script = path.join(tmp, 'run.luau');
+  fs.writeFileSync(script, 'return 1\n');
+
+  const missing = cli(['exec', script, '--backend', 'opencloud']);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /needs --universe and --place-id/);
+
+  const confused = cli(['exec', script, '--backend', 'opencloud', '--universe', '1', '--place', 'x.rbxl']);
+  assert.equal(confused.status, 1);
+  assert.match(confused.stderr, /--place-id/);
+
+  const noScript = cli(['exec', '--backend', 'opencloud', '--universe', '1', '--place-id', '2']);
+  assert.equal(noScript.status, 1);
+  assert.match(noScript.stderr, /script path/);
+});
+
+test('opencloud exec says what is missing when there is no api key', () => {
+  const script = path.join(tmp, 'run.luau');
+  fs.writeFileSync(script, 'return 1\n');
+  const res = cliEnv(
+    ['exec', script, '--backend', 'opencloud', '--universe', '1', '--place-id', '2'],
+    { ROBLOX_CLOUD_API_KEY: '', RBLX_OC_API_KEY: '' },
+  );
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /no Open Cloud API key/);
+  assert.match(res.stderr, /create\.roblox\.com/);
+});
+
+test('plain exec without studio points at opencloud instead of just failing', () => {
+  const res = cli(['exec', 'run.luau']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /--backend opencloud/);
+  assert.match(res.stderr, /--place-id/);
+});
+
+test('opencloud exec runs a script and returns its results as JSON', async () => {
+  const { child, port } = startStub();
+  try {
+    const script = path.join(tmp, 'server.luau');
+    fs.writeFileSync(script, 'return { ok = true }\n');
+    const p = await port;
+    const res = cliEnv(
+      ['exec', script, '--backend', 'opencloud', '--universe', '1', '--place-id', '2', '--json'],
+      {
+        ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=',
+        ROBLOX_CLOUD_BASE_URL: `http://127.0.0.1:${p}`,
+      },
+    );
+    assert.equal(res.status, 0, res.stderr);
+    const payload = JSON.parse(res.stdout);
+    assert.equal(payload.state, 'COMPLETE');
+    assert.equal(payload.backend, 'opencloud');
+    assert.equal(payload.placeVersion, 4, 'versions/4 is reported as 4');
+    assert.deepEqual(payload.results, { ok: true, answer: 42 });
+    // The script reached the far end, and the server's own output came back.
+    assert.match(payload.logs, /script was: return \{ ok = true \}/);
+  } finally {
+    child.kill();
+  }
+});
+
+test("a failing script's logs are not swallowed", async () => {
+  const { child, port } = startStub({ STUB_FAIL: '1' });
+  try {
+    const script = path.join(tmp, 'boom.luau');
+    fs.writeFileSync(script, 'error("boom")\n');
+    const p = await port;
+    const res = cliEnv(
+      ['exec', script, '--backend', 'opencloud', '--universe', '1', '--place-id', '2'],
+      { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=', ROBLOX_CLOUD_BASE_URL: `http://127.0.0.1:${p}` },
+    );
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /script was: error\("boom"\)/, 'output from the run is kept');
+    assert.match(res.stderr, /the script failed on the Roblox server/);
+    assert.match(res.stderr, /stub script failed on purpose/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('doctor reports the open cloud key state without failing the install', () => {
+  const withoutKey = cliEnv(['doctor'], { ROBLOX_CLOUD_API_KEY: '', RBLX_OC_API_KEY: '' });
+  assert.equal(withoutKey.status, 0, 'no key is a capability limit, not a failure');
+  assert.match(withoutKey.stdout, /open cloud: no api key/);
+
+  const withKey = cliEnv(['doctor'], { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=' });
+  assert.equal(withKey.status, 0);
+  assert.match(withKey.stdout, /open cloud: api key found/);
+});
+
+test('publish sends a built place and reports the version it got back', async () => {
+  const { child, port } = startStub();
+  try {
+    // A build spec, so this exercises build -> publish rather than a bare file.
+    const spec = path.join(tmp, 'deploy-spec.json');
+    fs.writeFileSync(
+      spec,
+      JSON.stringify({
+        className: 'Workspace',
+        name: 'Workspace',
+        children: [{ className: 'Part', name: 'Brick', properties: { Size: [4, 4, 4] } }],
+      }),
+    );
+    const p = await port;
+    const res = cliEnv(
+      ['publish', spec, '--universe', '1', '--place-id', '2', '--json'],
+      { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=', ROBLOX_CLOUD_BASE_URL: `http://127.0.0.1:${p}` },
+    );
+    assert.equal(res.status, 0, res.stderr);
+    const payload = JSON.parse(res.stdout);
+    assert.equal(payload.versionNumber, 41);
+    assert.equal(payload.versionType, 'Published');
+    assert.equal(payload.builtFrom, spec, 'the caller is told it was built, not published raw');
+    assert.equal(payload.bytes, payload.builtBytes);
+    assert.match(res.stderr, /published .*version 41/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('deploy builds, publishes, and runs against the version it just published', async () => {
+  const { child, port } = startStub();
+  try {
+    const spec = path.join(tmp, 'loop-spec.json');
+    fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'Brick' }));
+    const smoke = path.join(tmp, 'smoke.luau');
+    fs.writeFileSync(smoke, 'local n = #workspace:GetDescendants()\nreturn n\n');
+    const p = await port;
+    const res = cliEnv(
+      [
+        'deploy', spec,
+        '--universe', '1', '--place-id', '2',
+        '--run', smoke,
+        '--json',
+      ],
+      { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=', ROBLOX_CLOUD_BASE_URL: `http://127.0.0.1:${p}` },
+    );
+    assert.equal(res.status, 0, res.stderr);
+    const payload = JSON.parse(res.stdout);
+    assert.equal(payload.versionNumber, 41);
+    assert.equal(payload.state, 'COMPLETE');
+    assert.equal(payload.ran, smoke);
+    assert.deepEqual(payload.results, { ok: true, answer: 42 });
+    // The smoke test asked for version 41, not "latest".
+    assert.match(payload.logs, /script was: local n = #workspace:GetDescendants\(\)/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('deploy without a run script says plainly that nothing was executed', async () => {
+  const { child, port } = startStub();
+  try {
+    const spec = path.join(tmp, 'quiet-spec.json');
+    fs.writeFileSync(spec, JSON.stringify({ className: 'Part', name: 'Brick' }));
+    const p = await port;
+    const res = cliEnv(
+      ['deploy', spec, '--universe', '1', '--place-id', '2', '--json'],
+      { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=', ROBLOX_CLOUD_BASE_URL: `http://127.0.0.1:${p}` },
+    );
+    assert.equal(res.status, 0, res.stderr);
+    const payload = JSON.parse(res.stdout);
+    assert.equal(payload.ran, null);
+    assert.match(payload.note, /nothing was executed/);
+  } finally {
+    child.kill();
+  }
+});
+
+test('publish mistakes are caught before a request is made', () => {
+  const noIds = cli(['publish', 'out.rbxl']);
+  assert.equal(noIds.status, 1);
+  assert.match(noIds.stderr, /publish needs --universe and --place-id/);
+
+  const wrongFile = cliEnv(
+    ['publish', 'notes.txt', '--universe', '1', '--place-id', '2'],
+    { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=' },
+  );
+  assert.equal(wrongFile.status, 1);
+  assert.match(wrongFile.stderr, /expected a \.rbxl or \.rbxlx place file/);
+
+  const badType = cliEnv(
+    ['publish', 'out.rbxl', '--universe', '1', '--place-id', '2', '--version-type', 'Live'],
+    { ROBLOX_CLOUD_API_KEY: 'dGVzdC1rZXk=' },
+  );
+  assert.equal(badType.status, 1);
+  assert.match(badType.stderr, /versionType must be one of Published or Saved/);
+});
+
+test('publish without a key names the permission that publishing needs', () => {
+  const res = cliEnv(
+    ['publish', 'out.rbxl', '--universe', '1', '--place-id', '2'],
+    { ROBLOX_CLOUD_API_KEY: '', RBLX_OC_API_KEY: '' },
+  );
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /no Open Cloud API key/);
+  assert.match(res.stderr, /universe-places/, 'publishing needs a different scope than executing');
 });

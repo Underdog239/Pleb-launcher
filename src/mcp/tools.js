@@ -6,7 +6,9 @@
 // what Studio cannot do headlessly (create_model, build, view_scene, convert).
 
 import fs from 'node:fs';
-import { resolveBackend, listBackends, local } from '../backends/index.js';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveBackend, listBackends, local, opencloud } from '../backends/index.js';
 import { loadModel, saveModel, formatFor } from '../rbx/io.js';
 import { viewSvg, sceneSummary } from '../backends/local/view.js';
 import {
@@ -20,6 +22,33 @@ import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from '../luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
 import { describeClass, describeEnum, classesWithProperty, searchApi } from '../rbx/api.js';
+
+/**
+ * The studio backend takes a file, so an inline script is written to one.
+ *
+ * It goes to a temp file rather than anywhere in the workspace, and it is
+ * deliberately not deleted until the process exits: Studio reads it
+ * asynchronously and may still be holding it open when this call returns.
+ */
+function writeTempScript(args, script) {
+  if (typeof script !== 'string') return undefined;
+  const file = path.join(
+    os.tmpdir(),
+    `studio-mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.luau`,
+  );
+  fs.writeFileSync(file, script);
+  return file;
+}
+
+/** Read a script file, with an error that says which path failed. */
+function readScriptFile(file) {
+  if (!file) throw new Error('execute_luau needs either scriptFile or script');
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    throw new Error(`cannot read the script at ${file}: ${err.message}`);
+  }
+}
 
 /**
  * Load the model a tool was pointed at.
@@ -419,26 +448,73 @@ export const tools = [
   {
     name: 'execute_luau',
     description:
-      'Execute Luau with full engine fidelity. Requires the studio backend (Studio on Windows/macOS); the local backend cannot run engine Luau.',
+      'Actually run Luau and get its output, rather than reading it. Two backends: "studio" runs the script in a local Studio at command-bar permission, with physics and the place\'s scripts; "opencloud" runs it on a real Roblox server with the place loaded, headless and with the place\'s own scripts stopped. The local backend cannot run engine Luau at all.',
     inputSchema: {
       type: 'object',
       properties: {
         scriptFile: { type: 'string', description: 'Path to a .lua/.luau file to run' },
-        placeId: { type: 'integer' },
-        universeId: { type: 'integer' },
+        script: { type: 'string', description: 'Inline script, instead of scriptFile' },
+        backend: {
+          type: 'string',
+          enum: ['studio', 'opencloud'],
+          description: 'Where to run. Defaults to whichever is available.',
+        },
+        universeId: { type: 'integer', description: 'Experience id (opencloud)' },
+        placeId: { type: 'integer', description: 'Place id (opencloud)' },
+        placeVersion: { type: 'integer', description: 'Place version; latest if omitted (opencloud)' },
         localPlaceFile: { type: 'string' },
         outputFile: { type: 'string' },
+        timeoutSeconds: { type: 'integer' },
       },
-      required: ['scriptFile'],
     },
     handler: async (args, ctx) => {
-      if (ctx.backend.name !== 'studio') {
-        throw new Error(
-          'execute_luau needs the studio backend. Studio runs Luau at command-bar permission via ' +
-            '--task RunScript. On Linux there is no Studio; use Open Cloud Luau Execution instead.',
-        );
+      const canStudio = ctx.backend.name === 'studio';
+      const wants = args.backend || (canStudio ? 'studio' : opencloud.available() ? 'opencloud' : null);
+
+      if (wants === 'opencloud') {
+        if (!opencloud.available()) throw new Error(opencloud.unavailableReason());
+        const script = args.script ?? readScriptFile(args.scriptFile);
+        if (!args.universeId || !args.placeId) {
+          throw new Error(
+            'the opencloud backend needs universeId and placeId (the experience and place to load)',
+          );
+        }
+        const result = await opencloud.executeLuau({
+          script,
+          universeId: args.universeId,
+          placeId: args.placeId,
+          placeVersion: args.placeVersion ?? null,
+          timeoutMs: args.timeoutSeconds ? args.timeoutSeconds * 1000 : undefined,
+        });
+        return {
+          state: result.state,
+          backend: 'opencloud',
+          placeVersion: result.placeVersion ?? null,
+          logs: result.logText,
+          results: result.output?.results ?? null,
+          error: result.error ?? null,
+        };
       }
-      return ctx.backend.runScript(args);
+
+      if (wants === 'studio') {
+        if (!canStudio) {
+          throw new Error(
+            'the studio backend is not available on this host (no Studio installed).\n' +
+              'Open Cloud can run Luau headlessly instead: pass backend "opencloud" with ' +
+              'universeId and placeId, and set ROBLOX_CLOUD_API_KEY.',
+          );
+        }
+        // Studio's CLI takes a file, so an inline script is written to one.
+        const scriptFile = args.scriptFile ?? writeTempScript(args, args.script);
+        if (!scriptFile) throw new Error('execute_luau needs either scriptFile or script');
+        return ctx.backend.runScript({ ...args, scriptFile });
+      }
+
+      throw new Error(
+        'execute_luau has nowhere to run: no Studio on this host and no Open Cloud API key.\n' +
+          'Set ROBLOX_CLOUD_API_KEY (scope universe.place.luau-execution-session:write) and pass ' +
+          'backend "opencloud" with universeId and placeId.',
+      );
     },
   },
   {

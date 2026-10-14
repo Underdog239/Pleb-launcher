@@ -1,8 +1,9 @@
 // studio-cli — Roblox Studio as a command line interface for agents.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { listBackends, resolveBackend, local, studio } from './backends/index.js';
+import { listBackends, resolveBackend, local, studio, opencloud } from './backends/index.js';
 import { loadModel, saveModel, formatFor } from './rbx/io.js';
 import { viewSvg, sceneSummary } from './backends/local/view.js';
 import { runStdioServer } from './mcp/server.js';
@@ -111,6 +112,13 @@ export function checkEnvironment() {
       ? studioPath
       : `not installed (local backend only — no engine Luau; ${mcpPath ? 'MCP server found' : 'no MCP server'})`,
   });
+  checks.push({
+    name: 'open cloud',
+    ok: true, // optional: no key is a capability limit, not a broken install
+    detail: opencloud.available()
+      ? 'api key found: headless engine Luau is available (studio exec --backend opencloud)'
+      : 'no api key: headless engine Luau unavailable (set ROBLOX_CLOUD_API_KEY to enable)',
+  });
 
   return checks;
 }
@@ -142,6 +150,17 @@ export const FLAGS = {
   proxy: 'boolean',
   // reference graph
   broken: 'boolean',
+  // open cloud execution. `--place` already means "the place file" for the
+  // studio backend, and `--version` already prints this tool's own version, so
+  // the ids and the place version get unambiguous names of their own.
+  universe: 'value',
+  'place-id': 'value',
+  'place-version': 'value',
+  poll: 'value',
+  timeout: 'value',
+  quiet: 'boolean',
+  'version-type': 'value',
+  run: 'value',
 };
 
 const SHORT_FLAGS = { h: 'help', v: 'version', o: 'output', i: 'ignore-case' };
@@ -206,6 +225,43 @@ Model files: .rbxm .rbxl (binary) and .rbxmx .rbxlx (XML).
  * `studio model spec.json --output=tower.rbxm` (a form agents emit constantly)
  * used to write `out.rbxm` while reporting success.
  */
+/**
+ * Get a publishable place file out of whatever the user pointed at.
+ *
+ * `.rbxl`/`.rbxlx` is published as it stands. A Rojo project or a build spec is
+ * built first, into a temporary file, and the caller is told that happened so
+ * nothing is published silently.
+ */
+function preparePlaceFile(source, flags) {
+  const ext = path.extname(String(source)).toLowerCase();
+  if (ext === '.rbxl' || ext === '.rbxlx') return { placeFile: source, built: false };
+
+  let roots;
+  if (ext === '.json') {
+    const spec = JSON.parse(fs.readFileSync(source, 'utf8'));
+    // A Rojo project has a tree; a build spec has a class. Both are accepted
+    // here because both are what someone has in front of them before a deploy.
+    if (spec.className || spec.class) roots = local.modelFromSpec(spec);
+    else roots = local.buildFromProject(source).roots;
+  } else {
+    throw new Error(
+      `cannot publish ${source}: expected a .rbxl or .rbxlx place file, or a .json project/spec`,
+    );
+  }
+  void flags;
+
+  const target = path.join(os.tmpdir(), `studio-publish-${process.pid}-${Date.now()}.rbxl`);
+  const bytes = saveModel(target, roots);
+  return { placeFile: target, built: true, builtBytes: bytes };
+}
+
+/** `versions/3` -> 3; a bare number stays a number. */
+function parseVersion(value) {
+  if (value === null || value === undefined) return null;
+  const m = /(\d+)\s*$/.exec(String(value));
+  return m ? Number(m[1]) : null;
+}
+
 export function parseArgs(argv) {
   const positional = [];
   const flags = {};
@@ -523,10 +579,76 @@ export async function run(argv = process.argv.slice(2)) {
       }
 
       case 'exec': {
+        // Two ways to run a script, and they are not interchangeable, so the
+        // choice is explicit and its requirements are checked before anything
+        // is sent. Studio runs at command-bar permission with physics and the
+        // place's own scripts; Open Cloud runs headless on a real server, with
+        // that place's scripts deliberately stopped.
+        const wantsOpenCloud = flags.backend === 'opencloud' || backend.name === 'opencloud';
+
+        if (wantsOpenCloud) {
+          const scriptPath = rest[0];
+          if (!scriptPath) throw new Error('exec needs a script path: studio exec run.luau');
+          const script = fs.readFileSync(scriptPath, 'utf8');
+          const universeId = flags.universe;
+          const placeId = flags['place-id'];
+          if (!placeId && flags.place) {
+            throw new Error(
+              'with the opencloud backend the place id is spelled --place-id, because --place means ' +
+                `the studio backend's local place file: studio exec ${scriptPath} --backend opencloud ` +
+                '--universe 123456 --place-id 987654',
+            );
+          }
+          const missing = [];
+          if (!universeId) missing.push('--universe');
+          if (!placeId) missing.push('--place-id');
+          if (missing.length > 0) {
+            throw new Error(
+              `opencloud exec needs ${missing.join(' and ')}: studio exec ${scriptPath} ` +
+                '--backend opencloud --universe 123456 --place-id 987654 [--place-version 3]',
+            );
+          }
+          if (!opencloud.available()) throw new Error(opencloud.unavailableReason());
+
+          const result = await opencloud.executeLuau({
+            script,
+            universeId,
+            placeId,
+            placeVersion: flags['place-version'] ?? null,
+            timeoutMs: flags.timeout ? Number(flags.timeout) * 1000 : undefined,
+            pollMs: flags.poll ? Number(flags.poll) * 1000 : undefined,
+            onPoll: flags.quiet === true ? null : (state) => process.stderr.write(`opencloud ${state}\n`),
+          });
+
+          const payload = {
+            state: result.state,
+            backend: 'opencloud',
+            universeId: Number(universeId),
+            placeId: Number(placeId),
+            placeVersion: parseVersion(result.placeVersion ?? null),
+            path: result.path,
+            logs: result.logText,
+            results: result.output?.results ?? null,
+            error: result.error ?? null,
+          };
+
+          // The script's own output goes to stderr in human mode, so stdout
+          // stays a clean JSON value that a shell pipeline can consume.
+          if (result.error) {
+            if (flags.quiet !== true && result.logText) process.stderr.write(result.logText);
+            if (flags.json) return out(payload, flags);
+            throw new Error(`the script failed on the Roblox server: ${JSON.stringify(result.error)}`);
+          }
+          if (flags.quiet !== true && result.logText) process.stderr.write(result.logText);
+          return out(flags.json ? payload : (payload.results ?? null), flags);
+        }
+
         if (backend.name !== 'studio') {
           throw new Error(
-            'exec needs the studio backend (Studio --task RunScript). This host has no Studio; ' +
-              'on Linux use Open Cloud Luau Execution, or inspect/build the model locally.',
+            'exec needs the studio backend (Studio --task RunScript), and this host has no Studio.\n' +
+              'On Linux or in CI, run it on Roblox\'s own servers instead:\n' +
+              '  studio exec run.luau --backend opencloud --universe 123456 --place-id 987654\n' +
+              'That needs an Open Cloud API key with the luau-execution scope; see docs/backends.md.',
           );
         }
         const result = await studio.runScript({
@@ -535,6 +657,135 @@ export async function run(argv = process.argv.slice(2)) {
           outputFile: flags.output,
         });
         return out(result, flags);
+      }
+
+      case 'publish': {
+        // Convenience: a project or a build spec can be given directly, and it
+        // is built first. Anything ending in .rbxl/.rbxlx is published as-is.
+        const source = rest[0];
+        if (!source) throw new Error('publish needs a place file, a Rojo project, or a build spec');
+        const universeId = flags.universe;
+        const placeId = flags['place-id'];
+        const missing = [];
+        if (!universeId) missing.push('--universe');
+        if (!placeId) missing.push('--place-id');
+        if (missing.length > 0) {
+          throw new Error(
+            `publish needs ${missing.join(' and ')}: studio publish out.rbxl --universe 123456 ` +
+              '--place-id 987654 [--version-type Published|Saved]',
+          );
+        }
+        if (!opencloud.available()) throw new Error(opencloud.unavailableReason('publish'));
+
+        const versionType = flags['version-type'] ?? 'Published';
+        const { placeFile, built, builtBytes } = preparePlaceFile(source, flags);
+
+        let result;
+        try {
+          result = await opencloud.publishPlace({
+            placeFile,
+            universeId,
+            placeId,
+            versionType,
+          });
+        } catch (err) {
+          throw new Error(opencloud.explainPublishError(err));
+        }
+
+        const payload = {
+          universeId: Number(universeId),
+          placeId: Number(placeId),
+          versionType: result.versionType,
+          versionNumber: result.versionNumber,
+          bytes: result.bytes,
+          placeFile: result.placeFile,
+          ...(built ? { builtFrom: source, builtBytes } : {}),
+        };
+        if (flags.quiet !== true) {
+          process.stderr.write(
+            `published ${result.placeFile} as ${versionType} version ${result.versionNumber} ` +
+              `(place ${placeId}, ${result.bytes} bytes)\n`,
+          );
+        }
+        return out(payload, flags);
+      }
+
+      case 'deploy': {
+        // The whole loop in one command: build a place from a project or a spec,
+        // publish it, then run a script against the version that was just
+        // published. Nothing here needs Studio, a GUI, or a Windows machine.
+        const source = rest[0];
+        if (!source) throw new Error('deploy needs a Rojo project, a build spec, or a place file');
+        const universeId = flags.universe;
+        const placeId = flags['place-id'];
+        const missing = [];
+        if (!universeId) missing.push('--universe');
+        if (!placeId) missing.push('--place-id');
+        if (missing.length > 0) {
+          throw new Error(
+            `deploy needs ${missing.join(' and ')}: studio deploy default.project.json --universe 123456 ` +
+              '--place-id 987654 [--run smoke.luau]',
+          );
+        }
+        if (!opencloud.available()) throw new Error(opencloud.unavailableReason('publish'));
+
+        const versionType = flags['version-type'] ?? 'Published';
+        const { placeFile, built, builtBytes } = preparePlaceFile(source, flags);
+
+        let published;
+        try {
+          published = await opencloud.publishPlace({ placeFile, universeId, placeId, versionType });
+        } catch (err) {
+          throw new Error(opencloud.explainPublishError(err));
+        }
+        if (flags.quiet !== true) {
+          process.stderr.write(
+            `published ${versionType} version ${published.versionNumber} from ${placeFile}` +
+              `${built ? ` (built from ${source})` : ''}\n`,
+          );
+        }
+
+        const runFile = flags.run;
+        if (!runFile) {
+          return out(
+            {
+              ...published,
+              ...(built ? { builtFrom: source, builtBytes } : {}),
+              ran: null,
+              note: 'no --run script given, so nothing was executed against the new version',
+            },
+            flags,
+          );
+        }
+
+        // Pinned to the version just published, not "latest": if someone else
+        // publishes in between, the smoke test must still measure this build.
+        const result = await opencloud.executeLuau({
+          script: fs.readFileSync(runFile, 'utf8'),
+          universeId,
+          placeId,
+          placeVersion: published.versionNumber,
+          timeoutMs: flags.timeout ? Number(flags.timeout) * 1000 : undefined,
+          pollMs: flags.poll ? Number(flags.poll) * 1000 : undefined,
+        });
+
+        const payload = {
+          ...published,
+          ...(built ? { builtFrom: source, builtBytes } : {}),
+          ran: runFile,
+          state: result.state,
+          results: result.output?.results ?? null,
+          logs: result.logText,
+          error: result.error ?? null,
+        };
+
+        if (flags.quiet !== true && result.logText) process.stderr.write(result.logText);
+        if (result.error) {
+          if (flags.json) return out(payload, flags);
+          throw new Error(`the smoke test failed: ${JSON.stringify(result.error)}`);
+        }
+        if (flags.json) return out(payload, flags);
+        return out(payload.results ?? null, flags);
       }
 
       case 'api': {
