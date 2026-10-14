@@ -19,7 +19,7 @@ import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from './luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
-import { describeClass, describeEnum, classesWithProperty, searchApi } from './rbx/api.js';
+import { describeClass, describeEnum, classesWithProperty, searchApi, apiDataInfo } from './rbx/api.js';
 
 const VERSION = '0.1.0';
 
@@ -72,6 +72,19 @@ export function checkEnvironment() {
     checks.push({ name: 'mcp tools', ok: toolList().length > 0, detail: `${toolList().length} exposed` });
   } catch (err) {
     checks.push({ name: 'mcp tools', ok: false, detail: String(err?.message || err) });
+  }
+
+  try {
+    const info = apiDataInfo();
+    checks.push({
+      name: 'api data',
+      ok: true,
+      detail:
+        `${info.classCount} classes, ${info.enumCount} enums, ${info.enumItemCount} enum items` +
+        (info.hasAccessFlags ? `, ${info.annotatedProperties} properties with access flags` : ' (no access flags — regenerate)'),
+    });
+  } catch (err) {
+    checks.push({ name: 'api data', ok: false, detail: String(err?.message || err) });
   }
 
   try {
@@ -544,12 +557,25 @@ export async function run(argv = process.argv.slice(2)) {
           if (flags.json) return out(info, flags);
           if (!info.found) return notFoundWith(term, info.suggestions, flags);
 
-          const row = (p) =>
-            `  ${p.name}${' '.repeat(Math.max(1, 32 - p.name.length))}${p.type}` +
-            `${p.enum ? ' (enum)' : ''}${p.referenceTo ? ` -> ${p.referenceTo}` : ''}` +
-            `${p.serializedName && p.serializedName !== p.name ? `  [saved as ${p.serializedName}]` : ''}` +
-            `${p.declaringClass === info.name ? '' : `  (from ${p.declaringClass})`}`;
+          // The markers are the point of this listing: `!` means a game script
+          // cannot write it, `~` means deprecated, `@` means read-only. Without
+          // them an agent sees a property, writes an assignment, and the
+          // assignment silently does nothing at runtime.
+          const row = (p) => {
+            const mark = p.readOnly ? '@' : !p.writableFromGame ? '!' : p.deprecated ? '~' : ' ';
+            const notes = [];
+            if (p.serializedName && p.serializedName !== p.name) notes.push(`saved as ${p.serializedName}`);
+            if (p.writeSecurity && p.writeSecurity !== 'None') notes.push(p.writeSecurity);
+            if (p.declaringClass !== info.name) notes.push(`from ${p.declaringClass}`);
+            return (
+              `  ${mark} ${p.name}${' '.repeat(Math.max(1, 30 - p.name.length))}${p.type}` +
+              `${p.enum ? ' (enum)' : ''}${p.referenceTo ? ` -> ${p.referenceTo}` : ''}` +
+              `${notes.length > 0 ? `  [${notes.join('; ')}]` : ''}`
+            );
+          };
 
+          const restricedCount = info.properties.filter((p) => !p.writableFromGame).length;
+          const deprecatedCount = info.properties.filter((p) => p.deprecated).length;
           const lines = [
             `${info.name}  (extends ${info.superclass})`,
             info.isService
@@ -557,7 +583,10 @@ export async function run(argv = process.argv.slice(2)) {
               : info.creatable
                 ? '  creatable: Instance.new works'
                 : '  not creatable: the engine provides it',
-            `  ${info.savedCount} propert${info.savedCount === 1 ? 'y' : 'ies'} saved to model files`,
+            ...(info.deprecated ? ['  DEPRECATED by the engine'] : []),
+            `  ${info.savedCount} propert${info.savedCount === 1 ? 'y' : 'ies'} saved to model files` +
+              (restricedCount > 0 ? `, ${restricedCount} not writable from a game script` : '') +
+              (deprecatedCount > 0 ? `, ${deprecatedCount} deprecated` : ''),
             ...info.properties.map(row),
           ];
           if (info.runtimeProperties.length > 0) {
@@ -570,6 +599,7 @@ export async function run(argv = process.argv.slice(2)) {
           } else if (info.hiddenCount > 0) {
             lines.push('', `  ${info.hiddenCount} further dump-internal entries; --all lists them`);
           }
+          lines.push('', '  ! not writable from a game script   ~ deprecated   @ read-only');
           return out(lines.join('\n'), flags);
         }
 
@@ -578,8 +608,12 @@ export async function run(argv = process.argv.slice(2)) {
           const info = describeEnum(term);
           if (flags.json) return out(info, flags);
           if (!info.found) return notFoundWith(term, info.suggestions, flags);
+          const itemLines = info.items.map(
+            (i) => `  ${i.deprecated ? '~' : ' '} ${i.name} = ${i.value}`,
+          );
+          if (info.deprecatedCount > 0) itemLines.push('', '  ~ deprecated by the engine');
           return out(
-            [`${info.name}  (${info.count} items)`, ...info.items.map((i) => `  ${i.name} = ${i.value}`)].join('\n'),
+            [`${info.name}  (${info.count} items)`, ...itemLines].join('\n'),
             flags,
           );
         }

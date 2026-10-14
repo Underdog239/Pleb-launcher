@@ -660,3 +660,68 @@ test('FindFirstChild returning nil is normal and is not reported', () => {
   );
   assert.deepEqual(checkTreeBindings(scriptsInModel(roots), roots).diagnostics, []);
 });
+
+// ---------------------------------------------------------------------------
+// Access flags: what the engine will and will not let a script do
+// ---------------------------------------------------------------------------
+
+test('a property a game script cannot write is reported, with the level', () => {
+  const src = [
+    'local http = game:GetService("HttpService")',
+    'http.HttpEnabled = true',
+    'return http',
+  ].join('\n');
+  const d = find(src, 'write-restricted');
+  assert.ok(d, 'expected write-restricted');
+  assert.equal(d.severity, 'warning');
+  assert.match(d.message, /LocalUserSecurity/);
+  assert.equal(d.line, 2);
+});
+
+test('a deprecated property assignment is reported', () => {
+  const d = find('local p = Instance.new("Part")\np.BackParamA = 1\nreturn p', 'deprecated-property');
+  assert.ok(d, 'expected deprecated-property');
+  assert.equal(d.line, 2);
+});
+
+test('a deprecated enum item is reported but still accepted', () => {
+  const d = find('local t = Enum.AlignType.Parallel\nreturn t', 'deprecated-enum-item');
+  assert.ok(d, 'expected deprecated-enum-item');
+  assert.equal(d.severity, 'warning');
+  // It must not also be reported as unknown: the item exists.
+  assert.ok(!codes('local t = Enum.AlignType.Parallel').includes('unknown-enum-item'));
+});
+
+test('service bindings from GetService are tracked like Instance.new', () => {
+  // Without this, the properties a game script most often cannot write would
+  // never be checked, because they are reached through a service.
+  assert.deepEqual(codes('local http = game:GetService("HttpService")\nhttp.HttpEnabled = true'), [
+    'write-restricted',
+  ]);
+  // And a service whose properties are all writable stays silent.
+  assert.deepEqual(codes('local ws = game:GetService("Workspace")\nws.Gravity = 100'), []);
+});
+
+test('ordinary scriptable properties stay silent under the access checks', () => {
+  const src = [
+    'local part = Instance.new("Part")',
+    'part.Anchored = true',
+    'part.CanCollide = false',
+    'part.CFrame = CFrame.new()',
+    'part.Size = Vector3.new(1, 1, 1)',
+    'part.Material = Enum.Material.Neon',
+    'part.Transparency = 0.5',
+    'local hum = Instance.new("Humanoid")',
+    'hum.Health = 100',
+    'hum.WalkSpeed = 16',
+    'local model = Instance.new("Model")',
+    'model.PrimaryPart = part',
+    'return model, hum',
+  ].join('\n');
+  assert.deepEqual(check(src), []);
+});
+
+test('a property reached through an unknown local is never checked', () => {
+  // `thing` could be anything, so no claim is made about its properties.
+  assert.deepEqual(codes('thing.BackParamA = 1\nthing.HttpEnabled = true\nlocal x = thing.MeshId'), []);
+});

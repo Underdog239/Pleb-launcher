@@ -19,7 +19,16 @@
 // src/luau/lexer.js.
 
 import { codeTokens } from './lexer.js';
-import { db, hasClass, classInfo, isEnumValueType, enumValue, enumItems } from '../rbx/reflection.js';
+import {
+  db,
+  hasClass,
+  classInfo,
+  isEnumValueType,
+  enumValue,
+  enumItems,
+  propertyAccessFor,
+  isDeprecatedEnumItem,
+} from '../rbx/reflection.js';
 import { closestName } from '../rbx/validate.js';
 
 export const ERROR = 'error';
@@ -242,6 +251,22 @@ function checkEnumItems(tokens, out, file) {
           },
         ),
       );
+    } else if (isDeprecatedEnumItem(category.value, item.value)) {
+      out.push(
+        diag(
+          WARNING,
+          'deprecated-enum-item',
+          `Enum.${category.value}.${item.value} is deprecated by the engine`,
+          {
+            file,
+            line: item.line,
+            col: item.col,
+            actual: item.value,
+            path: `Enum.${category.value}.${item.value}`,
+            hint: 'the item still works, but new code should not use it',
+          },
+        ),
+      );
     }
   }
 }
@@ -333,16 +358,40 @@ function checkDeprecated(tokens, out, file) {
  * `Instance.new("Class")`, so the check never guesses at a type.
  */
 function checkPropertyTypos(tokens, out, file) {
-  /** local name -> class name, for literals we are certain about. */
+  /** local name -> class name, for bindings we are certain about. */
   const known = new Map();
-  for (let i = 0; i < tokens.length - 5; i++) {
+
+  // `local p = Instance.new("Part")` and `local http = game:GetService("HttpService")`
+  // are both literal class bindings, so both are certain. Services matter a lot
+  // here: HttpService.HttpEnabled, Players.MaxPlayersInternal and the other
+  // local-user settings are exactly the properties a game script cannot write,
+  // and they are reached through a service, not through Instance.new.
+  for (let i = 0; i < tokens.length - 7; i++) {
     if (tokens[i]?.value !== 'local' || tokens[i + 1]?.type !== 'ident') continue;
     if (tokens[i + 2]?.value !== '=') continue;
-    if (tokens[i + 3]?.value !== 'Instance' || tokens[i + 4]?.value !== '.') continue;
-    if (tokens[i + 5]?.value !== 'new') continue;
-    if (tokens[i + 6]?.value !== '(') continue;
-    const arg = tokens[i + 7];
-    if (arg?.type === 'string' && hasClass(arg.value)) known.set(tokens[i + 1].value, arg.value);
+
+    // Instance.new("Class")
+    if (
+      tokens[i + 3]?.value === 'Instance' &&
+      tokens[i + 4]?.value === '.' &&
+      tokens[i + 5]?.value === 'new' &&
+      tokens[i + 6]?.value === '('
+    ) {
+      const arg = tokens[i + 7];
+      if (arg?.type === 'string' && hasClass(arg.value)) known.set(tokens[i + 1].value, arg.value);
+      continue;
+    }
+
+    // game:GetService("Class")
+    if (
+      tokens[i + 3]?.value === 'game' &&
+      tokens[i + 4]?.value === ':' &&
+      tokens[i + 5]?.value === 'GetService' &&
+      tokens[i + 6]?.value === '('
+    ) {
+      const arg = tokens[i + 7];
+      if (arg?.type === 'string' && hasClass(arg.value)) known.set(tokens[i + 1].value, arg.value);
+    }
   }
   if (known.size === 0) return;
 
@@ -356,7 +405,57 @@ function checkPropertyTypos(tokens, out, file) {
 
     const className = known.get(name.value);
     const ser = propertyNamesFor(className);
-    if (ser.has(prop.value)) continue;
+
+    if (ser.has(prop.value)) {
+      // The property is real, so the only thing left to say about it is what
+      // the API says: whether it is deprecated, and who may write it.
+      const access = propertyAccessFor(className, prop.value);
+      if (access.recorded) {
+        if (access.deprecated) {
+          out.push(
+            diag(WARNING, 'deprecated-property', `${className}.${prop.value} is deprecated by the engine`, {
+              file,
+              line: prop.line,
+              col: prop.col,
+              actual: prop.value,
+              path: `${className}.${prop.value}`,
+              hint: 'the property still works, but new code should not set it',
+            }),
+          );
+        }
+        if (access.readOnly) {
+          out.push(
+            diag(WARNING, 'read-only-property', `${className}.${prop.value} is read-only; this assignment has no effect`, {
+              file,
+              line: prop.line,
+              col: prop.col,
+              actual: prop.value,
+              path: `${className}.${prop.value}`,
+            }),
+          );
+        } else if (!access.writableFromGame) {
+          out.push(
+            diag(
+              WARNING,
+              'write-restricted',
+              `${className}.${prop.value} cannot be written from a game script ` +
+                `(write security: ${access.writeSecurity})`,
+              {
+                file,
+                line: prop.line,
+                col: prop.col,
+                actual: access.writeSecurity,
+                expected: 'None',
+                path: `${className}.${prop.value}`,
+                hint: 'the engine ignores the assignment; set it in the model or from a plugin',
+              },
+            ),
+          );
+        }
+      }
+      continue;
+    }
+
     const suggestion = closestName(prop.value, [...ser]);
     if (!suggestion) continue; // nothing close: not a typo we can name
     out.push(

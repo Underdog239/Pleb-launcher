@@ -21,6 +21,181 @@ export function hasClass(className) {
   return Object.prototype.hasOwnProperty.call(db().classes, className);
 }
 
+// --- access flags ----------------------------------------------------------
+//
+// The API dump records, for every property, who is allowed to read and write it,
+// and whether it is read-only, deprecated, scriptable, browsable or replicated.
+// That is the difference between "the assignment compiles" and "the assignment
+// does nothing", and it is packed into one integer per property by
+// scripts/gen-reflection.mjs (see FLAG BITS there) so the table stays small.
+//
+// Reflection files generated before the flags existed simply have no slot 5.
+// Everything here degrades to "not recorded" rather than guessing.
+
+/** Security levels, weakest first. Index is what the flag bits store. */
+export const SECURITY_LEVELS = [
+  'None',
+  'LocalUserSecurity',
+  'PluginSecurity',
+  'RobloxScriptSecurity',
+  'RobloxSecurity',
+  'NotAccessibleSecurity',
+];
+
+const PROPERTY_BITS = {
+  ReadOnly: 1 << 6,
+  Deprecated: 1 << 7,
+  NotScriptable: 1 << 8,
+  Hidden: 1 << 9,
+  NotBrowsable: 1 << 10,
+  NotReplicated: 1 << 11,
+};
+
+const CLASS_BITS = {
+  Deprecated: 1 << 0,
+  NotBrowsable: 1 << 1,
+  NotReplicated: 1 << 2,
+  PlayerReplicated: 1 << 3,
+};
+
+/**
+ * Which classes of writer each security level admits.
+ *
+ * `game` is a normal script running in a place — the case an agent is almost
+ * always writing for. `plugin` is a Studio plugin, which the engine grants
+ * PluginSecurity. `studio` is the command bar and other local-user surfaces.
+ *
+ * RobloxScriptSecurity and RobloxSecurity belong to the engine's own core
+ * scripts; no user code, including plugins, is granted them. NotAccessible
+ * grants nothing at all. None of this is inferred — it is read from the dump.
+ */
+const SECURITY_ACCESS = {
+  None: { game: true, plugin: true, studio: true },
+  LocalUserSecurity: { game: false, plugin: false, studio: true },
+  PluginSecurity: { game: false, plugin: true, studio: true },
+  RobloxScriptSecurity: { game: false, plugin: false, studio: false },
+  RobloxSecurity: { game: false, plugin: false, studio: false },
+  NotAccessibleSecurity: { game: false, plugin: false, studio: false },
+};
+
+let _hasAccessFlags = null;
+
+/** Does the loaded table carry per-property access flags at all? */
+export function hasAccessFlags() {
+  if (_hasAccessFlags === null) {
+    _hasAccessFlags = (db().annotatedProperties ?? 0) > 0;
+  }
+  return _hasAccessFlags;
+}
+
+/**
+ * Does it carry class-level flags? Checked separately because a dump can have
+ * property flags before class flags (or the reverse), and each should degrade
+ * on its own rather than pretending the other is absent.
+ */
+let _hasClassAccessFlags = null;
+
+export function hasClassAccessFlags() {
+  if (_hasClassAccessFlags === null) {
+    _hasClassAccessFlags = Object.values(db().classes).some((c) => c.flags !== undefined);
+  }
+  return _hasClassAccessFlags;
+}
+
+/**
+ * Decode what the API says about reading and writing one property.
+ *
+ * @returns {{
+ *   recorded: boolean, writeSecurity: string, readSecurity: string,
+ *   readOnly: boolean, deprecated: boolean, notScriptable: boolean,
+ *   hidden: boolean, notBrowsable: boolean, notReplicated: boolean,
+ *   writableFromGame: boolean, writableFromPlugin: boolean, writableFromStudio: boolean,
+ * }}
+ */
+export function propertyAccessFor(className, propName) {
+  // Read from the merged table, not the class's own declarations: `Part.Anchored`
+  // is declared on BasePart, and looking only at Part would report it as
+  // unflagged. Inheriting the flags is the correct answer.
+  const merged = allPropertiesFor(className).get(propName);
+  const flags = merged?.flags || 0;
+  if (!merged) {
+    return {
+      recorded: false,
+      writeSecurity: 'None',
+      readSecurity: 'None',
+      readOnly: false,
+      deprecated: false,
+      notScriptable: false,
+      hidden: false,
+      notBrowsable: false,
+      notReplicated: false,
+      writableFromGame: true,
+      writableFromPlugin: true,
+      writableFromStudio: true,
+    };
+  }
+  const writeSecurity = SECURITY_LEVELS[flags & 7];
+  const readSecurity = SECURITY_LEVELS[(flags >> 3) & 7];
+  const readOnly = (flags & PROPERTY_BITS.ReadOnly) !== 0;
+  const access = { ...SECURITY_ACCESS[writeSecurity] };
+  return {
+    // Per-property flags are only meaningful if the file carries them at all;
+    // a zero flag means "nothing to record", so the file is the signal.
+    recorded: hasAccessFlags(),
+    writeSecurity,
+    readSecurity,
+    readOnly,
+    deprecated: (flags & PROPERTY_BITS.Deprecated) !== 0,
+    notScriptable: (flags & PROPERTY_BITS.NotScriptable) !== 0,
+    hidden: (flags & PROPERTY_BITS.Hidden) !== 0,
+    notBrowsable: (flags & PROPERTY_BITS.NotBrowsable) !== 0,
+    notReplicated: (flags & PROPERTY_BITS.NotReplicated) !== 0,
+    // A read-only property cannot be written by anyone, whatever the security
+    // level says, so the two are combined into the answer callers want.
+    writableFromGame: access.game && !readOnly,
+    writableFromPlugin: access.plugin && !readOnly,
+    writableFromStudio: access.studio && !readOnly,
+  };
+}
+
+/** What the dump says about a class itself. */
+export function classAccessFor(className) {
+  const flags = classInfo(className)?.flags || 0;
+  return {
+    recorded: hasClassAccessFlags(),
+    deprecated: (flags & CLASS_BITS.Deprecated) !== 0,
+    notBrowsable: (flags & CLASS_BITS.NotBrowsable) !== 0,
+    notReplicated: (flags & CLASS_BITS.NotReplicated) !== 0,
+    playerReplicated: (flags & CLASS_BITS.PlayerReplicated) !== 0,
+  };
+}
+
+/** Was this enum item deprecated by the engine? */
+export function isDeprecatedEnumItem(enumName, itemName) {
+  const list = db().deprecatedItems?.[enumName];
+  return Array.isArray(list) && list.includes(itemName);
+}
+
+/**
+ * What the loaded reflection table says about itself, so `doctor` can report
+ * how fresh the data is and whether it carries the access flags at all.
+ */
+export function dataVersion() {
+  const d = db();
+  const annotated = d.annotatedProperties ?? null;
+  return {
+    source: d.source || null,
+    dumpVersion: d.dumpVersion ?? null,
+    classCount: d.classCount ?? Object.keys(d.classes).length,
+    enumCount: d.enumCount ?? Object.keys(d.enums).length,
+    // null means the file predates the flags; false means it has them but none
+    // needed recording, which cannot happen with a real dump.
+    annotatedProperties: annotated,
+    hasAccessFlags: typeof annotated === 'number' && annotated > 0,
+    hasDeprecatedEnumItems: !!d.deprecatedItems,
+  };
+}
+
 export function classInfo(className) {
   return db().classes[className] || null;
 }
@@ -82,6 +257,9 @@ export function allPropertiesFor(className) {
         canSave: canSave === 1,
         refClass: refClass || null,
         category,
+        // Kept raw here; `propertyAccessFor` decodes it, and anything that
+        // wants the bits without the decode can read this.
+        flags: entry[5] || 0,
         declaredOn: name,
       });
     }

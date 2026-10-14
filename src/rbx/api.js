@@ -19,6 +19,10 @@ import {
   classInfo,
   hasClass,
   resolveIsEnum,
+  propertyAccessFor,
+  classAccessFor,
+  isDeprecatedEnumItem,
+  dataVersion,
 } from './reflection.js';
 import { closestName } from './validate.js';
 
@@ -92,6 +96,7 @@ export function describeClass(name, { all = false } = {}) {
 
   const describe = (propName, prop, saved) => {
     const entry = ser.forward.get(propName);
+    const access = propertyAccessFor(name, propName);
     return {
       name: propName,
       type: prop.type,
@@ -101,6 +106,14 @@ export function describeClass(name, { all = false } = {}) {
       enum: resolveIsEnum(chain, propName, prop.type),
       declaringClass: prop.declaredOn || name,
       referenceTo: prop.refClass || null,
+      // Who may write it, straight from the dump. `writableFromGame` is the one
+      // an agent writing Luau needs: false means the assignment does nothing
+      // when the script runs, however well it reads.
+      writeSecurity: access.writeSecurity,
+      writableFromGame: access.writableFromGame,
+      readOnly: access.readOnly,
+      deprecated: access.deprecated,
+      ...(access.notScriptable ? { notScriptable: true } : {}),
     };
   };
 
@@ -123,6 +136,7 @@ export function describeClass(name, { all = false } = {}) {
   properties.sort((a, b) => a.name.localeCompare(b.name));
   runtimeProperties.sort((a, b) => a.name.localeCompare(b.name));
 
+  const classAccess = classAccessFor(name);
   return {
     found: true,
     name,
@@ -130,6 +144,7 @@ export function describeClass(name, { all = false } = {}) {
     superchain: chain,
     isService: info.service === 1,
     creatable: info.notCreatable !== 1,
+    deprecated: classAccess.deprecated,
     savedCount: properties.length,
     runtimeOnlyCount: runtimeProperties.length,
     hiddenCount: hidden.length,
@@ -146,10 +161,20 @@ export function describeEnum(name) {
     return { found: false, name, suggestions: suggestNames(name, 'enum') };
   }
   const items = enums[name];
-  const list = Object.entries(items).map(([itemName, value]) => ({ name: itemName, value }));
+  const list = Object.entries(items).map(([itemName, value]) => ({
+    name: itemName,
+    value,
+    ...(isDeprecatedEnumItem(name, itemName) ? { deprecated: true } : {}),
+  }));
   // The database stores them by name; the numeric order is the useful one.
   list.sort((a, b) => a.value - b.value || a.name.localeCompare(b.name));
-  return { found: true, name, count: list.length, items: list };
+  return {
+    found: true,
+    name,
+    count: list.length,
+    deprecatedCount: list.filter((i) => i.deprecated).length,
+    items: list,
+  };
 }
 
 /**
@@ -166,6 +191,7 @@ export function classesWithProperty(propName) {
     const prop = props.get(propName);
     if (!prop) continue;
     const ser = serializationFor(className).forward.get(propName);
+    const access = propertyAccessFor(className, propName);
     matches.push({
       className,
       type: prop.type,
@@ -174,6 +200,9 @@ export function classesWithProperty(propName) {
       enum: resolveIsEnum(superChain(className), propName, prop.type),
       referenceTo: prop.refClass || null,
       serializedName: ser ? ser.serializedName : null,
+      writeSecurity: access.writeSecurity,
+      writableFromGame: access.writableFromGame,
+      deprecated: access.deprecated,
     });
   }
   // The class that *declares* the property is the interesting answer, so it
@@ -288,6 +317,18 @@ function allPropertyNames() {
 function suggestPropertyNames(name) {
   const one = closestName(name, allPropertyNames());
   return one ? [one] : [];
+}
+
+/**
+ * A compact "what is this dataset" answer, for `doctor` and for an agent that
+ * wants to know how fresh the API data it is being checked against is.
+ */
+export function apiDataInfo() {
+  const v = dataVersion();
+  return {
+    ...v,
+    enumItemCount: Object.values(db().enums).reduce((n, items) => n + Object.keys(items).length, 0),
+  };
 }
 
 export { MAX_SUGGESTIONS };

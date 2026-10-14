@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { describeClass, describeEnum, classesWithProperty, searchApi, kindOf } from '../src/rbx/api.js';
+import {
+  describeClass,
+  describeEnum,
+  classesWithProperty,
+  searchApi,
+  kindOf,
+  apiDataInfo,
+} from '../src/rbx/api.js';
 import { db, serializationFor, allPropertiesFor } from '../src/rbx/reflection.js';
 
 test('a class reports its chain, whether it is creatable, and whether it is a service', () => {
@@ -209,4 +216,38 @@ test('a class listing is stable under a shared cache', () => {
   describeClass('Part');
   assert.equal(JSON.stringify(first.properties), snapshot);
   assert.equal(describeClass('Part').savedCount, first.savedCount);
+});
+
+test('a class listing says which properties a game script cannot write', () => {
+  const http = describeClass('HttpService');
+  const enabled = http.properties.find((p) => p.name === 'HttpEnabled');
+  assert.equal(enabled.writableFromGame, false);
+  assert.equal(enabled.writeSecurity, 'LocalUserSecurity');
+  // A normal property on the same class reports the opposite.
+  const name = http.properties.find((p) => p.name === 'Name');
+  assert.equal(name.writableFromGame, true);
+});
+
+test('deprecation is reported for classes, properties and enum items', () => {
+  assert.equal(describeClass('Hat').deprecated, true);
+  assert.equal(describeClass('Part').deprecated, false);
+  assert.equal(describeClass('Part').properties.find((p) => p.name === 'BackParamA').deprecated, true);
+
+  const align = describeEnum('AlignType');
+  assert.equal(align.deprecatedCount, 2);
+  assert.deepEqual(
+    align.items.filter((i) => i.deprecated).map((i) => i.name),
+    ['Parallel', 'Perpendicular'],
+  );
+  assert.equal(describeEnum('Material').deprecatedCount, 0);
+});
+
+test('apiDataInfo reports what the dataset actually contains', () => {
+  const info = apiDataInfo();
+  assert.equal(info.classCount, 935);
+  assert.equal(info.enumCount, 648);
+  assert.equal(info.hasAccessFlags, true);
+  assert.equal(info.hasDeprecatedEnumItems, true);
+  assert.ok(info.enumItemCount > 3000);
+  assert.match(info.source, /API Dump/);
 });

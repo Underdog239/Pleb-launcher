@@ -7,6 +7,9 @@
 
 import {
   allPropertiesFor,
+  propertyAccessFor,
+  classAccessFor,
+  isDeprecatedEnumItem,
   serializationFor,
   isEnumValueType,
   enumItems,
@@ -385,6 +388,19 @@ export function validateInstance(inst, options = {}) {
   const ser = serializationFor(inst.className);
   const known = knownPropertyNames(inst.className);
 
+  // Deprecated classes are still loadable, so they are a warning, not an error:
+  // an existing file full of `Hat` should not refuse to open.
+  const classAccess = classAccessFor(inst.className);
+  if (classAccess.deprecated) {
+    out.push(
+      diag(WARNING, 'deprecated-class', `${path}: ${inst.className} is deprecated by the engine`, {
+        path,
+        actual: inst.className,
+        note: 'the class still loads and saves, but new content should not use it',
+      }),
+    );
+  }
+
   const declared = allPropertiesFor(inst.className);
 
   for (const [prop, value] of inst.props) {
@@ -419,6 +435,62 @@ export function validateInstance(inst, options = {}) {
     }
 
     out.push(...validateValue(value, info, `${path}.${prop}`));
+
+    // Access flags are about what happens at *runtime*, and they are the
+    // difference between an assignment that works and one that silently does
+    // nothing. The file can hold the value either way, so these are warnings
+    // attached to the property rather than errors on the model.
+    //
+    // Gated on `!isDefaultish`, and that gate is what makes this usable: the
+    // binary encoder writes every serializable property including its default,
+    // so a round-tripped Part carries `BackParamA = 0` and a dozen other
+    // long-deprecated defaults that the engine itself put there. Warning about
+    // those would bury the model in noise. "You set a deprecated property to a
+    // value" is worth saying; "the serializer round-tripped a zero" is not.
+    const access = !isDefaultish(value) ? propertyAccessFor(inst.className, prop) : null;
+    if (access && access.recorded) {
+      if (access.deprecated) {
+        out.push(
+          diag(WARNING, 'deprecated-property', `${inst.className}.${prop} is deprecated by the engine`, {
+            path: `${path}.${prop}`,
+            actual: prop,
+            note: 'the property still saves, but new content should not set it',
+          }),
+        );
+      }
+      if (access.readOnly) {
+        out.push(
+          diag(
+            WARNING,
+            'read-only-property',
+            `${inst.className}.${prop} is read-only; the engine sets it and an assignment has no effect`,
+            { path: `${path}.${prop}`, actual: prop },
+          ),
+        );
+      } else if (!access.writableFromGame) {
+        // The value is in the file and will be loaded, which is the case that
+        // matters here: a build can set what a script cannot, and saying so
+        // prevents an agent from writing the same assignment into Luau and
+        // wondering why it does nothing.
+        out.push(
+          diag(
+            WARNING,
+            'write-restricted',
+            `${inst.className}.${prop} cannot be written from a game script ` +
+              `(write security: ${access.writeSecurity}); a file can still set it`,
+            {
+              path: `${path}.${prop}`,
+              actual: access.writeSecurity,
+              expected: 'None',
+              note:
+                access.notScriptable
+                  ? 'the API also marks this property as not scriptable'
+                  : 'set it in the model or from a plugin, not from a running game',
+            },
+          ),
+        );
+      }
+    }
 
     // A property the writer cannot represent is a silent loss, which is the
     // failure this module exists to prevent: an agent sets it, the write
