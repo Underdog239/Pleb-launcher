@@ -393,6 +393,122 @@ all land on the same node. Reported: `require-not-found`, `require-not-module`,
 `require-cycle` (once, pointing at the line that closes the loop), and
 `dynamic-require` as a note — never an error.
 
+### Deobfuscating Luau
+
+`studio deobfuscate` undoes the layers of obfuscation that are mechanically
+reversible, and reports the ones that are not. It is a pair of parsers — one
+that builds an AST from the source, one that prints it back — plus a set of
+rules over that AST. Nothing is pattern-matched out of raw text.
+
+```console
+$ studio deobfuscate examples/obfuscated/Encoded.server.luau --detect
+examples/obfuscated/Encoded.server.luau: obfuscation detected (score 75/100)
+
+  [high] generated-identifier-names: 16 of 27 name references look machine-written
+      evidence: _0x3b, _0x4c, _0x5d, _0x7f, _0x6e, _0x91, _0xa2, _0x80
+      reversible: partly
+      Names can be replaced with inferred or neutral ones, but the originals are gone: a rename is not recoverable from the file.
+
+  [high] escape-encoded-strings: 7 of 10 string literals are mostly escape sequences
+      evidence: "\x67\x61\x6d\x65"
+      reversible: yes
+      These decode to their literal values, which is lossless.
+
+  [high] dynamic-code-loading: the script builds and runs code at runtime (loadstring/getfenv)
+      evidence: loadstring
+      reversible: partly
+      A loadstring call whose argument folds to a constant is inlined here. One whose argument depends on runtime state cannot be: the code does not exist until it runs.
+```
+
+```console
+$ studio deobfuscate examples/obfuscated/Encoded.server.luau
+-- Deobfuscated by studio-cli (studio deobfuscate).
+--
+-- Constants were folded, dead branches removed, and machine-generated local names
+-- replaced. Renamed variables are INFERRED from how they are used, not recovered:
+-- an obfuscator discards the original names and nothing can bring them back.
+--
+-- 5 constant fold(s), 4 inlined value(s), 2 branch(es) resolved, 1 loadstring inline(s), 5 rename(s).
+-- A script written the way a Luau obfuscator writes one, committed so that the
+-- README's output is reproducible rather than illustrative.
+local v1 = { 72, 101, 108, 108, 111 }
+local v2 = {}
+for v3 = 1, #v1 do
+  v2[v3] = string.char(v1[v3])
+end
+local v4 = table.concat(v2) .. ", world"
+print(v4)
+local v5 = game["GetService"]("Players")
+print(v5, "====")
+warn("booted")
+```
+
+The escapes are decoded, the constants are folded, the `if false` branch and the
+unreachable `error` are gone, and the constant `loadstring` is inlined. What is
+left is the machinery that a fold cannot remove: the byte array and the loop that
+decodes it, which is a runtime computation rather than a constant.
+
+#### What it does not do
+
+- **It does not recover your original variable names.** They are not in the file
+  — an obfuscator replaces them, and no tool can read what is not there. What
+  this does instead is *infer* names from how a variable is used: a local built
+  by `Instance.new("Part")` is renamed `part`, one built by
+  `game:GetService("HttpService")` is renamed `httpService`. Every rename is
+  listed in the report with the evidence that produced it, and a variable with no
+  evidence is given a neutral `v1`, `v2` rather than a confident-looking guess.
+  The header written into the output says the same thing. A tool that hands you
+  `local playerHealth` and calls it recovered is guessing and presenting the
+  guess as fact.
+- **It does not un-virtualize VM obfuscation.** Luraph and Moonsec's VM mode
+  compile a script into a bytecode for an interpreter they ship with it. Undoing
+  that means decompiling a VM you have never seen, and it is undecidable in
+  general. The detector recognises the dispatch-loop shape, reports it as
+  `vm-interpreter` with `reversible: no`, and stops there rather than emitting
+  plausible-looking garbage.
+- **It does not decrypt runtime-computed strings.** `string.char(bit32.bxor(...))`
+  over values that depend on the environment cannot be evaluated on this machine,
+  because they do not have a value here.
+- **It does not claim accuracy percentages.** Each pass is a rule that either
+  holds or does not; the rules are in `src/luau/transform.js`, and the tests in
+  `test/deobfuscate.test.mjs` include the cases each rule must refuse.
+
+#### Why you can trust the output
+
+The output is printed, re-parsed, and compared against the tree it was printed
+from. If the two differ, **nothing is written** and the command fails with the
+mismatch, because a transform that produced a different program is worse than no
+transform at all. That check caught two real bugs during development — a dropped
+`type` field that printed a table as the literal text `undefined`, and a
+parenthesisation rule that changed `2 ^ -3`.
+
+It is a structural check, not a proof: two different programs can have the same
+tree. Behaviour preservation rests on the per-pass rules, which is why each one
+is narrow and refuses the cases it does not handle:
+
+| pass | rule |
+|---|---|
+| constant folding | only whitelisted pure stdlib calls (`string.*`, `bit32.*`, `math.*`, `table.concat`, `tostring`, `tonumber`, `type`, `select`), arithmetic, comparisons and `and`/`or`/`not` — with Lua's `%`, `//` and `^` semantics, not JavaScript's, and never a value with no literal form such as `inf` or `nan` |
+| inlining | single-assignment locals initialised by a literal and never captured by a closure; a table only when every read is a constant index or a `#` |
+| dead code | an `if` only when the condition folds to a boolean; `while true do ... end` unwrapped only when no `break` or `continue` belongs to it; a numeric `for` that cannot iterate |
+| `loadstring` | only a constant chunk, and only when it does not read a name that is a local anywhere in the file — a compiled chunk does not see the caller's locals |
+| renaming | locals only, never globals, with evidence recorded per rename; `--no-rename` turns it off |
+
+```bash
+studio deobfuscate script.luau                 # print the deobfuscated source
+studio deobfuscate script.luau -o clean.luau   # ...and write it (only if the check passes)
+studio deobfuscate script.luau --report        # per-pass counts and every rename with its evidence
+studio deobfuscate script.luau --json          # the report as data
+studio deobfuscate script.luau --detect        # what is obfuscated here, and what cannot be undone
+studio deobfuscate script.luau --rename-all    # rename every local, not only generated-looking ones
+studio deobfuscate script.luau --no-fold --no-simplify
+```
+
+The MCP surface is one tool, `deobfuscate`, taking `source` or `file` and
+returning `code`, `report`, `detection` and `verification` — so an agent gets the
+transformed script and the list of names it must not present as ground truth in
+the same response.
+
 ### What depends on what
 
 ```console
@@ -448,7 +564,7 @@ studio doctor
 # ok    node: v22.22.3
 # ok    reflection database: 935 classes, 648 enums
 # ok    serialization patches: BasePart.Size -> size, BasePart.Color -> Color3uint8
-# ok    mcp tools: 24 exposed
+# ok    mcp tools: 25 exposed
 # ok    api data: 935 classes, 648 enums, 3700 enum items, 1822 properties with access flags
 # ok    value type coverage: 363/370 binary, 361/370 xml (370 types in use)
 # ok    roblox studio: not installed (local backend only — no engine Luau; no MCP server)
@@ -580,6 +696,7 @@ Tools exposed (names mirror Studio's own MCP server where they overlap):
 | `require_graph` | yes | yes | require edges, cycles, dynamic requires |
 | `instance_references` | yes | yes | reference graph + broken references |
 | `sourcemap` | yes | yes | instance tree + the file behind each node |
+| `deobfuscate` | yes | yes | undo reversible obfuscation; report what cannot be undone |
 | `asset_inventory` | yes | yes | every asset a model references |
 | `impact_analysis` | yes | yes | what breaks if an instance is deleted |
 | `format_coverage` | yes | yes | which value types each format can carry |
@@ -689,12 +806,13 @@ a blob sha, and the generator follows that through the blob API instead.
 ## Tests
 
 ```bash
-npm test          # 324 tests: LZ4, binary codec, XML codec, reflection and the
+npm test          # 377 tests: LZ4, binary codec, XML codec, reflection and the
                   # API access flags, validation, project build, CLI, MCP, script
                   # search/diff/edit, a round-trip test per value type in both
-                  # codecs, the Luau lexer and analyser, the require graph, the
-                  # reference graph / asset inventory / impact analysis, and the
-                  # Open Cloud backend against a stub server
+                  # codecs, the Luau lexer, parser, printer and analyser, the
+                  # deobfuscator and every pass it refuses to run, the require
+                  # graph, the reference graph / asset inventory / impact
+                  # analysis, and the Open Cloud backend against a stub server
 ```
 
 Nothing in the suite touches the network. The Open Cloud tests start a local

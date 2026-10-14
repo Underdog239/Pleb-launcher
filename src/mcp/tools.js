@@ -19,10 +19,12 @@ import {
   coverageReport,
 } from '../rbx/validate.js';
 import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
+import { parse as parseLuau } from '../luau/parse.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from '../luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
 import { describeClass, describeEnum, classesWithProperty, searchApi } from '../rbx/api.js';
 import { sourceMapFromProject, sourceMapFromModel, countNodes } from '../rbx/sourcemap.js';
+import { deobfuscate, detectObfuscation } from '../luau/deobfuscate.js';
 
 /**
  * The studio backend takes a file, so an inline script is written to one.
@@ -542,6 +544,44 @@ export const tools = [
           'Set ROBLOX_CLOUD_API_KEY (scope universe.place.luau-execution-session:write) and pass ' +
           'backend "opencloud" with universeId and placeId.',
       );
+    },
+  },
+  {
+    name: 'deobfuscate',
+    description:
+      'Undo the mechanically reversible layers of an obfuscated Luau script: decode escape-encoded strings, fold constants, evaluate pure stdlib calls, resolve string tables, remove dead branches, inline constant loadstring chunks, and rename machine-generated locals. Returns the transformed source plus a report. It does NOT recover original variable names (an obfuscator discards them) and does NOT un-virtualize VM obfuscation; both are reported rather than attempted. Set detectOnly to just report what obfuscation is present.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Luau source to deobfuscate' },
+        file: { type: 'string', description: 'Read the source from this file instead' },
+        detectOnly: { type: 'boolean', description: 'Only report what obfuscation is present' },
+        rename: { type: 'boolean', description: 'Rename generated locals (default true)' },
+        renameAll: { type: 'boolean', description: 'Rename every local, not just generated-looking ones' },
+        output: { type: 'string', description: 'Also write the result to this path' },
+      },
+    },
+    handler: (args) => {
+      const source =
+        args.source !== undefined ? String(args.source) : readScriptFile(args.file);
+      if (args.detectOnly) {
+        const detection = detectObfuscation(parseLuau(source), source);
+        return detection;
+      }
+      const result = deobfuscate(source, {
+        rename: args.rename !== false,
+        renameAll: args.renameAll === true,
+        fold: args.fold !== false,
+        simplify: args.simplify !== false,
+      });
+      if (args.output) fs.writeFileSync(args.output, result.code);
+      return {
+        code: result.code,
+        ...(args.output ? { output: args.output } : {}),
+        report: result.report,
+        detection: result.detection,
+        verification: result.verification,
+      };
     },
   },
   {

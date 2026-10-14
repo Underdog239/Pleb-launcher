@@ -18,6 +18,8 @@ import {
 } from './rbx/validate.js';
 import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
+import { deobfuscate, detectObfuscation, DeobfuscationError } from './luau/deobfuscate.js';
+import { parse as parseLuau } from './luau/parse.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from './luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
 import { sourceMapFromProject, sourceMapFromModel, countNodes } from './rbx/sourcemap.js';
@@ -163,6 +165,13 @@ export const FLAGS = {
   'version-type': 'value',
   run: 'value',
   'include-non-scripts': 'boolean',
+  // deobfuscation
+  report: 'boolean',
+  detect: 'boolean',
+  rename: 'boolean',
+  'rename-all': 'boolean',
+  fold: 'boolean',
+  simplify: 'boolean',
 };
 
 const SHORT_FLAGS = { h: 'help', v: 'version', o: 'output', i: 'ignore-case' };
@@ -201,6 +210,8 @@ COMMANDS
   deploy <project.json|spec.json>        Build, publish, and optionally smoke-test
          --universe N --place-id N [--run smoke.luau]
   sourcemap <project|place> [-o F]       sourcemap.json for Luau tooling
+  deobfuscate <file> [-o out]            Fold constants, cut dead code, rename
+         [--report] [--detect] [--rename-all] [--no-fold] [--no-simplify]
   api dump [-o out.json]                 Dump Studio's API surface (needs Studio)
   api class <ClassName>                  Properties, types, and what is saved
   api enum <EnumName>                    Items and their numeric values
@@ -292,7 +303,14 @@ export function parseArgs(argv) {
   // Records the flag; reports back whether the caller still has to supply a
   // value from the next argv token (`--output x` / `-o x`).
   const setFlag = (name, raw) => {
-    const kind = FLAGS[name];
+    let key = name;
+    // `--no-<flag>` turns a boolean off. Writing it once here means every
+    // boolean flag gets a negation, rather than each command inventing its own.
+    if (FLAGS[key] === undefined && key.startsWith('no-') && FLAGS[key.slice(3)] === 'boolean') {
+      flags[key.slice(3)] = false;
+      return false;
+    }
+    const kind = FLAGS[key];
     if (kind === undefined) {
       const suggestion = closestName(`--${name}`, flagNames);
       throw new Error(`unknown option: --${name}${suggestion ? ` — did you mean ${suggestion}?` : ''}`);
@@ -679,6 +697,115 @@ export async function run(argv = process.argv.slice(2)) {
           outputFile: flags.output,
         });
         return out(result, flags);
+      }
+
+      case 'deobfuscate': {
+        const target = rest[0];
+        if (!target) throw new Error('deobfuscate needs a .lua/.luau file');
+
+        // `--detect` answers "is this obfuscated, and how?" without changing
+        // anything, which is the question you want answered before trusting the
+        // transform on a file you care about.
+        let source;
+        try {
+          source = fs.readFileSync(target, 'utf8');
+        } catch (err) {
+          throw new Error(`cannot read ${target}: ${err.message}`);
+        }
+
+        if (flags.detect) {
+          const parsed = parseLuau(source);
+          const detection = detectObfuscation(parsed, source, parsed.tokens);
+          if (flags.json) return out(detection, flags);
+          const lines = [
+            detection.obfuscated
+              ? `${target}: obfuscation detected (score ${detection.score}/100)`
+              : `${target}: no obfuscation detected`,
+          ];
+          for (const f of detection.findings) {
+            lines.push('');
+            lines.push(`  [${f.severity}] ${f.technique}: ${f.detail}`);
+            if (f.evidence) lines.push(`      evidence: ${f.evidence}`);
+            lines.push(`      reversible: ${f.reversible}`);
+            if (f.note) lines.push(`      ${f.note.replace(/\s+/g, ' ')}`);
+          }
+          if (detection.irreversible.length > 0) {
+            lines.push('');
+            lines.push(`  cannot be undone: ${detection.irreversible.join(', ')}`);
+          }
+          return out(lines.join('\n'), flags);
+        }
+
+        let result;
+        try {
+          result = deobfuscate(source, {
+            rename: flags.rename !== false,
+            renameAll: flags['rename-all'] === true,
+            fold: flags.fold !== false,
+            simplify: flags.simplify !== false,
+          });
+        } catch (err) {
+          if (err instanceof DeobfuscationError) {
+            if (flags.json) return out({ ok: false, error: err.message, output: err.code ?? null }, flags);
+            throw new Error(err.message);
+          }
+          if (err && err.name === 'ParseError') {
+            throw new Error(
+              `${target} could not be parsed, so it was not transformed (${err.message}). ` +
+                'Nothing was written.',
+            );
+          }
+          throw err;
+        }
+
+        const payload = {
+          input: target,
+          ...result.report,
+          detection: result.detection,
+          verification: result.verification,
+        };
+
+        if (flags.output) {
+          fs.writeFileSync(flags.output, result.code);
+          payload.output = flags.output;
+          payload.bytes = Buffer.byteLength(result.code);
+        }
+
+        if (flags.json) return out(payload, flags);
+        if (flags.report) {
+          const lines = [
+            `${target}:`,
+            `  obfuscation score: ${result.detection.score}/100` +
+              (result.detection.techniques.length
+                ? ` (${result.detection.techniques.join(', ')})`
+                : ' (nothing found)'),
+            `  constants folded:  ${result.report.transformations.folded}`,
+            `  values inlined:    ${result.report.transformations.inlined}`,
+            `  branches resolved: ${result.report.transformations.deadBranches + result.report.transformations.liveBranches}`,
+            `  loops unwrapped:   ${result.report.transformations.unwrappedLoops}`,
+            `  loadstrings:       ${result.report.transformations.loadstringsInlined}`,
+            `  names renamed:     ${result.report.renames.length}`,
+          ];
+          if (result.report.renames.length > 0) {
+            lines.push('', '  renames (inferred, not recovered):');
+            for (const rename of result.report.renames) {
+              lines.push(`    ${rename.from} -> ${rename.to}  [${rename.evidence}]`);
+            }
+          }
+          for (const w of result.report.warnings) lines.push(`  warning: ${w.message}`);
+          if (result.detection.irreversible.length > 0) {
+            lines.push('', `  NOT undone: ${result.detection.irreversible.join(', ')}`);
+            for (const f of result.detection.findings) {
+              if (f.reversible === 'no') lines.push(`    ${f.technique}: ${f.note}`);
+            }
+          }
+          if (!flags.output) {
+            lines.push('', '  (no --output given, so nothing was written)');
+          }
+          return out(lines.join('\n'), flags);
+        }
+        if (!flags.output) return out(result.code, flags);
+        return out(payload, flags);
       }
 
       case 'sourcemap': {

@@ -345,12 +345,49 @@ test('execute_luau runs on opencloud and returns logs, results and state', async
 
 test('the tool list is stable and every tool still has a schema', () => {
   const tools = toolList();
-  assert.equal(tools.length, 24);
+  assert.equal(tools.length, 25);
   for (const t of tools) {
     assert.ok(t.name && t.description, `tool ${t.name} needs a name and description`);
     assert.equal(t.inputSchema.type, 'object');
   }
   assert.equal(findTool('execute_luau').inputSchema.properties.backend.enum.join(','), 'studio,opencloud');
+});
+
+test('the deobfuscate tool reports rather than pretends', async () => {
+  // String.raw keeps the escape sequences as the file would hold them: the
+  // point of the input is that it is written in \x escapes.
+  const obfuscated = String.raw`local _0x1 = "\x48\x69"
+local _0x2 = "\x57\x6f\x72\x6c\x64"
+local _0x3 = "\x42"
+print(_0x1, _0x2, _0x3, 1 + 1)`;
+  const out = await callTool('deobfuscate', { source: obfuscated });
+  assert.match(out.code, /print\("Hi", "World", "B", 2\)/);
+  assert.ok(out.detection.techniques.includes('escape-encoded-strings'));
+  // The header is what tells a reader the names are guesses, not recoveries.
+  assert.match(out.code, /INFERRED from how they are used, not recovered/);
+  assert.equal(out.verification.treeMatchesOutput, true);
+
+  const clean = await callTool('deobfuscate', { source: 'local n = 2\nreturn n' });
+  assert.equal(clean.detection.obfuscated, false);
+  // Nothing obfuscated here, but the tool still folds: the local is a literal
+  // used once, so it is inlined and `changed` is honestly true.
+  assert.match(clean.code, /return 2/);
+  assert.equal(clean.report.changed, true);
+
+  const detected = await callTool('deobfuscate', {
+    detectOnly: true,
+    source: 'loadstring("print(1)")()',
+  });
+  assert.ok(detected.techniques.includes('dynamic-code-loading'));
+
+  // One escaped string is not evidence of obfuscation: plenty of ordinary code
+  // contains a "\n" or a byte. The detector needs a pattern, not a coincidence.
+  const ordinary = await callTool('deobfuscate', {
+    detectOnly: true,
+    source: String.raw`local sep = "\t"
+return sep`,
+  });
+  assert.equal(ordinary.obfuscated, false);
 });
 
 test('publish_place defaults to a save, not a deploy', async () => {
