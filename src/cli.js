@@ -210,7 +210,8 @@ COMMANDS
   deploy <project.json|spec.json>        Build, publish, and optionally smoke-test
          --universe N --place-id N [--run smoke.luau]
   sourcemap <project|place> [-o F]       sourcemap.json for Luau tooling
-  deobfuscate <file> [-o out]            Fold constants, cut dead code, rename
+  deobfuscate <file> [-o out]            Fold constants, run decode loops, cut
+                                         dead code, rename
          [--report] [--detect] [--rename-all] [--no-fold] [--no-simplify]
   api dump [-o out.json]                 Dump Studio's API surface (needs Studio)
   api class <ClassName>                  Properties, types, and what is saved
@@ -784,6 +785,7 @@ export async function run(argv = process.argv.slice(2)) {
             `  branches resolved: ${result.report.transformations.deadBranches + result.report.transformations.liveBranches}`,
             `  loops unwrapped:   ${result.report.transformations.unwrappedLoops}`,
             `  loadstrings:       ${result.report.transformations.loadstringsInlined}`,
+            `  decode loops:      ${result.report.transformations.decodedLoops}`,
             `  names renamed:     ${result.report.renames.length}`,
           ];
           if (result.report.renames.length > 0) {

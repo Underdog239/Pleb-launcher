@@ -11,7 +11,7 @@
 // scope, because replacing a node invalidates the binding information attached
 // to the previous tree.
 
-import { evaluateConstant } from './deobfuscate.js';
+import { evaluateConstant, isPureStdlibCall } from './deobfuscate.js';
 import { parse } from './parse.js';
 
 /**
@@ -149,26 +149,58 @@ function inlineable(binding) {
   const constant = evaluateConstant(init);
   if (!constant) return false;
   if (constant.kind === 'table') {
-    // A table literal copied into every use site changes identity. It is only
-    // safe when the table is a read-only array that is never compared, never
-    // passed anywhere, and never grows — which is exactly the string-table
-    // case, so that is the only case allowed: every use is a constant index or
-    // a length.
-    return binding.reads.every(isConstantIndexOrLength);
+    // A table literal copied into every use site changes identity. That is only
+    // safe when the table is a read-only array that is never compared and never
+    // grows, so the uses allowed are:
+    //
+    //   - a constant index (`t[3]`) or a length (`#t`), which is the string-table
+    //     case and lets the next fold turn `t[3]` into the element; and
+    //   - an argument to a pure standard-library call (`table.concat(t)`), where
+    //     the callee reads the table and never keeps it — which is what turns a
+    //     decoded byte array into the string.
+    return binding.reads.every(
+      (read) => isConstantIndexOrLength(read, constant) || isPureCallArgument(read),
+    );
   }
   return true;
 }
 
-function isConstantIndexOrLength(node) {
+/**
+ * A read that is an argument to a call to a pure standard-library function.
+ *
+ * The callee must be a global the file does not shadow: if `table` is a local,
+ * `table.concat(t)` is the user's own function and may do anything with the
+ * table, including keeping it.
+ */
+function isPureCallArgument(node) {
+  const parent = node.__parent;
+  if (!parent || parent.type !== 'Call') return false;
+  if (!parent.args.includes(node)) return false;
+  return isPureStdlibCall(parent);
+}
+
+/**
+ * Is this read of the table one that the next fold will turn into a value?
+ *
+ * This is stricter than "the read is harmless", on purpose. A copy of a table
+ * is only interchangeable with the original when the copy is immediately folded
+ * away; a copy that survives to be printed has to be parenthesised where the
+ * original was not (`({}).concat(t)`), and the output no longer re-parses to the
+ * tree it came from. So the reads allowed are exactly the ones that fold: a
+ * `#`, and `t[n]` where `n` is a constant index inside the array.
+ *
+ * `t.field` is refused even though reading a field is harmless: with a copy, the
+ * printer has no way to write it back.
+ */
+function isConstantIndexOrLength(node, table) {
   const parent = node.__parent;
   if (!parent) return false;
   if (parent.type === 'Un' && parent.op === '#') return true;
-  if (parent.type === 'Index' && parent.obj === node && parent.keyIsName) return true;
-  if (parent.type === 'Index' && parent.obj === node) {
-    const constant = evaluateConstant(parent.key);
-    return constant !== null && (constant.kind === 'number' || constant.kind === 'string');
-  }
-  return false;
+  if (parent.type !== 'Index' || parent.obj !== node) return false;
+  if (parent.keyIsName) return false;
+  const key = evaluateConstant(parent.key);
+  if (!key || key.kind !== 'number') return false;
+  return Number.isInteger(key.value) && key.value >= 1 && key.value <= table.value.length;
 }
 
 /** Tag every node with its parent, so a use site can be examined in context. */
@@ -592,4 +624,327 @@ export function localNames(ast) {
   return names;
 }
 
-export { simplifyBlock, dropDeadDeclarations, hasReturn };
+
+// ---------------------------------------------------------------------------
+// Decode loops
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold the loop an obfuscator writes to build a string at runtime.
+ *
+ *     local src = { 72, 101, 108, 108, 111 }
+ *     local out = {}
+ *     for i = 1, #src do out[i] = string.char(src[i]) end
+ *     print(table.concat(out))
+ *
+ * Nothing in there is a constant, so an expression-by-expression fold cannot
+ * reach it: the string exists only once the loop has run. This pass runs the
+ * loop over the values it can see and replaces the accumulator's initialiser
+ * with the result, so the very next fold collapses `table.concat(out)`.
+ *
+ * Every rule below refuses rather than guesses:
+ *
+ *   - the source is a local, declared once, never reassigned, bound to a
+ *     constant array of numbers;
+ *   - the loop runs `1` to `#source` with step 1, so it reads every element and
+ *     nothing else;
+ *   - the accumulator is declared on the line immediately before the loop, as
+ *     `{}` or `""`, and written exactly once, in that loop;
+ *   - the body is that one assignment;
+ *   - the element expression folds once the element is substituted for
+ *     `source[i]` and the index for the loop variable. One element that will
+ *     not fold leaves the whole loop alone: a loop that decodes half a string
+ *     does not decode a string.
+ */
+export function foldDecodeLoops(ast, bindings, stats, report) {
+  const byName = new Map();
+  for (const binding of bindings) {
+    // Two bindings for one name means the name is reused somewhere; picking one
+    // would be a guess.
+    if (byName.has(binding.name)) byName.set(binding.name, null);
+    else byName.set(binding.name, binding);
+  }
+
+  let changed = 0;
+  eachStatementBlock(ast, (body) => {
+    for (let i = 1; i < body.length; i += 1) {
+      const loop = body[i];
+      const decl = body[i - 1];
+      if (!loop || loop.type !== 'NumericFor' || loop.body.length !== 1) continue;
+      if (!decl || decl.type !== 'LocalStat' || decl.names.length !== 1 || decl.exprs.length !== 1) continue;
+
+      const accumulator = decl.names[0].name;
+      const shape = seedShape(decl.exprs[0], loop.body[0], accumulator);
+      if (!shape) continue;
+
+      const plan = planDecodeLoop(loop, decl.exprs[0], accumulator, shape, byName);
+      if (!plan) continue;
+
+      const init = runDecodeLoop(plan);
+      if (!init) continue;
+
+      decl.exprs[0] = init;
+      body.splice(i, 1);
+      i -= 1;
+      changed += 1;
+      if (stats) stats.decodedLoops += 1;
+      if (report) report.decoded.push({ shape, length: plan.length });
+    }
+    return body;
+  });
+  return changed;
+}
+
+/** `{}` with `out[i] = ...`, or `""` with `out = out .. ...`? */
+function seedShape(seed, stat, accumulator) {
+  if (!stat || stat.type !== 'AssignStat') return null;
+  if (stat.targets.length !== 1 || stat.exprs.length !== 1) return null;
+  const target = stat.targets[0];
+  const expr = stat.exprs[0];
+
+  if (seed.type === 'Table' && seed.fields.length === 0) {
+    if (target.type !== 'Index' || target.keyIsName) return null;
+    if (!isName(target.obj, accumulator)) return null;
+    return 'array';
+  }
+
+  if (seed.type === 'Str' && seed.value === '') {
+    if (!isName(target, accumulator)) return null;
+    if (expr.type !== 'Bin' || expr.op !== '..') return null;
+    if (!isName(expr.left, accumulator)) return null; // `out .. x`, never `x .. out`
+    return 'string';
+  }
+
+  return null;
+}
+
+function isName(node, name) {
+  return node && node.type === 'Name' && node.name === name;
+}
+
+/** Everything the loop needs to be run, or null if any premise fails. */
+function planDecodeLoop(loop, seed, accumulator, shape, byName) {
+  const stat = loop.body[0];
+  const from = evaluateConstant(loop.from);
+  if (!from || from.kind !== 'number' || from.value !== 1) return null;
+  const step = loop.step ? evaluateConstant(loop.step) : { kind: 'number', value: 1 };
+  if (!step || step.kind !== 'number' || step.value !== 1) return null;
+
+  // Where do the elements come from? `#source` is the usual spelling; a literal
+  // count is allowed only when the source really is that long.
+  let sourceName = null;
+  let bound = null;
+  if (loop.to.type === 'Un' && loop.to.op === '#' && loop.to.operand.type === 'Name') {
+    sourceName = loop.to.operand.name;
+  } else {
+    bound = evaluateConstant(loop.to);
+    if (!bound || bound.kind !== 'number' || !Number.isInteger(bound.value) || bound.value < 0) return null;
+  }
+
+  const elementExpr = shape === 'array' ? stat.exprs[0] : stat.exprs[0].right;
+  const read = findSourceRead(elementExpr, sourceName);
+  if (!read) return null;
+  sourceName = read.name;
+
+  const sourceBinding = byName.get(sourceName);
+  if (!sourceBinding) return null;
+  if (sourceBinding.kind !== 'local') return null;
+  if (!sourceBinding.singleAssignment || sourceBinding.writeCount !== 0) return null;
+  const source = sourceBinding.init ? evaluateConstant(sourceBinding.init) : null;
+  if (!source) return null;
+
+  if (bound && source.kind === 'table' && source.value.length !== bound.value) return null;
+
+  const accumulatorBinding = byName.get(accumulator);
+  if (!accumulatorBinding) return null;
+  if (accumulatorBinding.kind !== 'local') return null;
+  if (accumulatorBinding.captured) return null;
+  // Its declaration is the line above the loop, so nothing can read the
+  // accumulator between the two, and nothing can write it either.
+  if (accumulatorBinding.init !== seed) return null;
+
+  if (shape === 'array') {
+    // `out[i] = ...` is not a write to `out` in the scope model, so what has to
+    // hold is that there is no plain assignment to `out` anywhere: the decoded
+    // table stays unless the code itself replaces it.
+    if (accumulatorBinding.writeCount !== 0) return null;
+  } else {
+    // `out = out .. ...` is a real write, and it must be this one.
+    if (accumulatorBinding.writeCount !== 1) return null;
+    if (!containsNode(stat, accumulatorBinding.writes[0])) return null;
+  }
+
+  const length = source.kind === 'table' ? source.value.length : source.value.length;
+  if (bound && source.kind === 'string' && source.value.length !== bound.value) return null;
+
+  return {
+    shape,
+    read,
+    source,
+    length,
+    loopVar: loop.name.name,
+    elementExpr,
+    accumulator,
+    line: loop.line,
+  };
+}
+
+/**
+ * The read of the source array inside the element expression.
+ *
+ * Returns `{ name, shape, key }`, where the shape says how an element is pulled
+ * out: `index` for `src[i]`, `sub` for `string.sub(src, i, i)` on a string.
+ */
+function findSourceRead(expr, expectedName) {
+  let found = null;
+  const visit = (node) => {
+    if (!node || typeof node !== 'object' || found) return;
+    if (node.type === 'Index' && node.obj && node.obj.type === 'Name' && !node.keyIsName) {
+      if (!expectedName || node.obj.name === expectedName) {
+        found = { name: node.obj.name, shape: 'index', key: node.key, node };
+        return;
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (SKIP.has(key)) continue;
+      const value = node[key];
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === 'object') visit(value);
+    }
+  };
+  visit(expr);
+  return found;
+}
+
+/** Run the loop, element by element, and build the accumulator's value. */
+function runDecodeLoop(plan) {
+  const values = [];
+  for (let k = 1; k <= plan.length; k += 1) {
+    const element =
+      plan.source.kind === 'table'
+        ? plan.source.value[k - 1]
+        : { kind: 'string', value: plan.source.value[k - 1] };
+    if (!element) return null;
+
+    // Substitution replaces AST nodes with AST nodes — `literal()` builds a
+    // node, not a value. Putting a bare constant in the tree is how the printer
+    // ends up emitting nothing at all.
+    const elementNode = literal(element);
+    if (!elementNode) return null;
+    const substitutions = new Map();
+    // The element itself: `src[i]` becomes the k-th value.
+    substitutions.set(plan.read.node, elementNode);
+    // The loop variable, wherever else the expression uses it.
+    collectNamed(plan.elementExpr, plan.loopVar, (node) =>
+      substitutions.set(node, { type: 'Number', value: k, raw: null }),
+    );
+
+    const substituted = substituteClone(plan.elementExpr, substitutions);
+    const value = evaluateConstant(substituted);
+    if (!value) return null;
+    values.push(value);
+  }
+
+  if (plan.shape === 'array') {
+    // The field shape must be the parser's exactly — `{kind, value}` and no
+    // `key` — or the printed table re-parses into a slightly different tree and
+    // the safety net refuses it, correctly.
+    const fields = values.map((value) => ({ kind: 'array', value: literal(value) }));
+    if (fields.some((f) => !f.value)) return null;
+    return { type: 'Table', fields, trailingSep: null, line: plan.line, col: 0 };
+  }
+
+  let out = '';
+  for (const value of values) {
+    if (value.kind !== 'string') return null;
+    out += value.value;
+  }
+  return { type: 'Str', value: out, raw: null };
+}
+
+/** Call `fn` with every Name node in `node` called `name`. */
+function collectNamed(node, name, fn) {
+  if (!node || typeof node !== 'object') return;
+  if (node.type === 'Name' && node.name === name) fn(node);
+  for (const key of Object.keys(node)) {
+    if (SKIP.has(key)) continue;
+    const value = node[key];
+    if (Array.isArray(value)) value.forEach((v) => collectNamed(v, name, fn));
+    else if (value && typeof value === 'object') collectNamed(value, name, fn);
+  }
+}
+
+/**
+ * A copy of `node` with the given nodes replaced.
+ *
+ * Substitution is by node identity, so nothing can be replaced by accident: the
+ * caller has to name the exact node it means.
+ */
+function substituteClone(node, substitutions) {
+  if (substitutions.has(node)) return { ...substitutions.get(node) };
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map((item) => substituteClone(item, substitutions));
+  const out = {};
+  for (const key of Object.keys(node)) {
+    // `type` must survive the copy, as it must in cloneNode: a node without a
+    // type is not a node, and the fold below silently refuses the whole loop.
+    if (SKIP.has(key) && key !== 'type') continue;
+    out[key] = substituteClone(node[key], substitutions);
+  }
+  return out;
+}
+
+/** Is `needle` one of the nodes inside `haystack`? */
+function containsNode(haystack, needle) {
+  if (!haystack || !needle) return false;
+  if (haystack === needle) return true;
+  let found = false;
+  const visit = (node) => {
+    if (found || !node || typeof node !== 'object') return;
+    if (node === needle) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (SKIP.has(key)) continue;
+      const value = node[key];
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === 'object') visit(value);
+    }
+  };
+  visit(haystack);
+  return found;
+}
+
+/**
+ * Every statement block in the tree.
+ *
+ * These passes need to see a block as a sequence — a declaration sitting next
+ * to the loop that uses it — so they cannot visit one statement at a time.
+ */
+function eachStatementBlock(node, visit) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    if (node.length > 0 && node[0] && isStatement(node[0].type)) visit(node);
+    for (const item of node) eachStatementBlock(item, visit);
+    return;
+  }
+  for (const key of Object.keys(node)) {
+    if (SKIP.has(key)) continue;
+    const value = node[key];
+    if (Array.isArray(value)) eachStatementBlock(value, visit);
+    else if (value && typeof value === 'object') eachStatementBlock(value, visit);
+  }
+}
+
+const STATEMENT_TYPES = new Set([
+  'LocalStat', 'LocalFunction', 'FunctionStat', 'AssignStat', 'CompoundStat', 'CallStat',
+  'IfStat', 'WhileStat', 'RepeatStat', 'NumericFor', 'GenericFor', 'DoStat', 'ReturnStat',
+  'BreakStat', 'ContinueStat', 'CommentStat', 'TypeStat',
+]);
+
+function isStatement(type) {
+  return STATEMENT_TYPES.has(type);
+}
+
+export { simplifyBlock, dropDeadDeclarations, hasReturn, eachStatementBlock };

@@ -549,7 +549,7 @@ export const tools = [
   {
     name: 'deobfuscate',
     description:
-      'Undo the mechanically reversible layers of an obfuscated Luau script: decode escape-encoded strings, fold constants, evaluate pure stdlib calls, resolve string tables, remove dead branches, inline constant loadstring chunks, and rename machine-generated locals. Returns the transformed source plus a report. It does NOT recover original variable names (an obfuscator discards them) and does NOT un-virtualize VM obfuscation; both are reported rather than attempted. Set detectOnly to just report what obfuscation is present.',
+      'Undo the mechanically reversible layers of an obfuscated Luau script: decode escape-encoded strings, fold constants, evaluate pure stdlib calls, run the loops that decode byte arrays into strings, remove dead branches, inline constant loadstring chunks, and rename machine-generated locals. Returns the transformed source plus a report. It does NOT recover original variable names (an obfuscator discards them) and does NOT un-virtualize VM obfuscation; both are reported rather than attempted. Set detectOnly to just report what obfuscation is present.',
     inputSchema: {
       type: 'object',
       properties: {

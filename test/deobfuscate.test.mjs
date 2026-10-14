@@ -222,6 +222,155 @@ test('a table is inlined only where every use is a constant index or a length', 
 });
 
 // ---------------------------------------------------------------------------
+// Decode loops
+// ---------------------------------------------------------------------------
+
+const BYTES = [
+  'local src = { 72, 101, 108, 108, 111 }',
+  'local out = {}',
+  'for i = 1, #src do out[i] = string.char(src[i]) end',
+  'print(table.concat(out))',
+].join('\n');
+
+test('the loop an obfuscator decodes a string with is run and folded away', () => {
+  assert.equal(body(deobfuscate(BYTES).code), 'print("Hello")');
+});
+
+test('a decode loop with a key applied folds too', () => {
+  const source = [
+    'local src = { 107, 104, 110, 110, 109 }',
+    'local out = {}',
+    'for i = 1, #src do out[i] = string.char(bit32.bxor(src[i], 3)) end',
+    'print(table.concat(out))',
+  ].join('\n');
+  assert.equal(body(deobfuscate(source).code), 'print("hkmmn")');
+});
+
+test('the accumulator may be built by concatenation instead of an array', () => {
+  const source = ['local src = { 72, 105 }', 'local s = ""', 'for i = 1, #src do s = s .. string.char(src[i]) end', 'print(s)'].join('\n');
+  assert.equal(body(deobfuscate(source).code), 'print("Hi")');
+});
+
+test('a decode loop is left alone when any element will not fold', () => {
+  // One element depends on the environment, so the loop cannot be run here.
+  const source = ['local src = { 1, 2, 3 }', 'local out = {}', 'for i = 1, #src do out[i] = src[i] * os.time() end', 'print(unpack(out))'].join('\n');
+  const out = body(deobfuscate(source).code);
+  assert.match(out, /for i = 1, #src do/);
+  assert.match(out, /os\.time\(\)/);
+});
+
+test('a decode loop over a source that is not constant is left alone', () => {
+  const source = ['local src = getBytes()', 'local out = {}', 'for i = 1, #src do out[i] = string.char(src[i]) end', 'print(table.concat(out))'].join('\n');
+  assert.match(body(deobfuscate(source).code), /for i = 1, #src do/);
+});
+
+test('a decode loop whose source is reassigned is left alone', () => {
+  const source = [...BYTES.split('\n').slice(0, 3), 'src = { 1 }', 'print(table.concat(out))'].join('\n');
+  const out = body(deobfuscate(source).code);
+  assert.match(out, /for i = 1, #src do/);
+});
+
+test('a decode loop that does not read every element is left alone', () => {
+  const source = [
+    'local src = { 72, 101, 108, 108, 111 }',
+    'local out = {}',
+    'for i = 1, 3 do out[i] = string.char(src[i]) end',
+    'print(table.concat(out))',
+  ].join('\n');
+  assert.match(body(deobfuscate(source).code), /for i = 1, 3 do/);
+});
+
+test('a decode loop whose accumulator is written elsewhere is left alone', () => {
+  const source = [
+    'local src = { 72, 105 }',
+    'local out = {}',
+    'for i = 1, #src do out[i] = string.char(src[i]) end',
+    'out = {}',
+    'print(table.concat(out))',
+  ].join('\n');
+  // The later assignment empties it again, so running the loop would change
+  // what the final print sees.
+  assert.match(body(deobfuscate(source).code), /out = \{\}/);
+});
+
+test('a decode loop is not folded when the declaration is not adjacent', () => {
+  const source = [
+    'local src = { 72, 105 }',
+    'local out = {}',
+    'print(#out)',
+    'for i = 1, #src do out[i] = string.char(src[i]) end',
+    'print(table.concat(out))',
+  ].join('\n');
+  // `print(#out)` reads the accumulator before the loop, so it must still be
+  // empty when it runs.
+  const out = body(deobfuscate(source).code);
+  assert.match(out, /local out = \{\}/);
+  assert.match(out, /print\(#out\)/);
+});
+
+// ---------------------------------------------------------------------------
+// Shadowing
+// ---------------------------------------------------------------------------
+
+test('a library name that is a local is not folded as the library', () => {
+  // `string` is the user's own table here. Folding would call a different
+  // function, and the output would have exactly the same shape, so nothing
+  // downstream could catch it.
+  const source = 'local string = { char = function() return "X" end }\nprint(string.char(72))';
+  const out = body(deobfuscate(source).code);
+  assert.match(out, /string\.char\(72\)/);
+  assert.doesNotMatch(out, /"H"/);
+});
+
+test('a shadowed global function is not folded either', () => {
+  const source = 'local tostring = function() return "Z" end\nprint(tostring(5))';
+  assert.match(body(deobfuscate(source).code), /tostring\(5\)/);
+});
+
+test('shadowing anywhere in the file disables folding for that name', () => {
+  // The local is in a function that never runs; the cost of refusing is a fold
+  // not made, and that is the side this deliberately errs on.
+  const source = [
+    'local function f(math)',
+    '  return math.floor(1.5)',
+    'end',
+    'print(math.floor(1.5), f)',
+  ].join('\n');
+  const out = body(deobfuscate(source).code);
+  assert.match(out, /math\.floor\(1\.5\)/);
+});
+
+test('unshadowed library calls still fold', () => {
+  assert.equal(folded('string.char(72, 105)'), 'return "Hi"');
+  assert.equal(folded('math.floor(1.7)'), 'return 1');
+  assert.equal(folded('tostring(5)'), 'return "5"');
+});
+
+test('a table is copied into a pure call but not into a function of unknown origin', () => {
+  // `table.concat` reads the table and never keeps it, so a copy is the same
+  // call — and then it folds.
+  assert.equal(body(deobfuscate('local t = {"a", "b"}\nprint(table.concat(t))').code), 'print("ab")');
+
+  // A user function might keep the table or mutate it, so it must not be
+  // copied to the use site.
+  const user = body(deobfuscate('local t = {1, 2}\nlocal function keep(x) return x end\nprint(keep(t))').code);
+  assert.match(user, /local t = \{ 1, 2 \}/);
+  assert.match(user, /print\(keep\(t\)\)/);
+
+  // ...and neither must a shadowed `table`.
+  const shadowed = ['local table = {}', 'local t = {"a"}', 'print(table.concat(t))'].join('\n');
+  assert.match(body(deobfuscate(shadowed).code), /table\.concat\(t\)/);
+});
+
+test('a name is inferred through a bracketed library call', () => {
+  const result = deobfuscate('local _0x1 = game["GetService"]("Players")\nprint(_0x1)');
+  assert.match(result.code, /local players = game\["GetService"\]\("Players"\)/);
+  const rename = result.report.renames.find((r) => r.to === 'players');
+  assert.ok(rename, 'the rename is reported');
+  assert.match(rename.evidence, /GetService/);
+});
+
+// ---------------------------------------------------------------------------
 // Dead code
 // ---------------------------------------------------------------------------
 

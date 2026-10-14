@@ -60,6 +60,7 @@ import {
   simplifyBlock,
   dropDeadDeclarations,
   localNames,
+  foldDecodeLoops,
 } from './transform.js';
 
 const MAX_PASSES = 12;
@@ -624,6 +625,9 @@ const BIT_LIB = new Set(['band', 'bor', 'bxor', 'bnot', 'lshift', 'rshift', 'ars
 
 const MATH_LIB = new Set(['floor', 'ceil', 'abs', 'max', 'min', 'sqrt', 'floor', 'round', 'sign', 'clamp']);
 
+/** Global functions with no side effects and no interest in identity. */
+const PURE_GLOBALS = new Set(['tostring', 'tonumber', 'type', 'typeof', 'select']);
+
 /** Lua's `%`: the result takes the sign of the divisor. */
 function luaMod(a, b) {
   if (b === 0) return null;
@@ -818,6 +822,60 @@ function numberToConcat(n) {
   return formatNumber(n);
 }
 
+/**
+ * Names that are locals somewhere in the file.
+ *
+ * `string.char(72)` is only the standard library if `string` is not a local.
+ * Shadowing is rare, but folding a call to a user's own function is not a
+ * transformation the safety net can catch — the output parses and has the same
+ * shape, it just calls a different function. So the evaluator asks this set
+ * before it treats any name as the standard library.
+ *
+ * It is deliberately over-broad, in the same way the loadstring check is: a
+ * local named `string` anywhere in the file disables library folding for the
+ * whole file. The cost is a missed fold, and a missed fold is not a bug.
+ */
+let SHADOWED_NAMES = new Set();
+
+/** Point the evaluator at the set of names that are locals in this file. */
+export function setShadowedNames(names) {
+  SHADOWED_NAMES = names || new Set();
+}
+
+/** Is this name a local somewhere, so that using it as a library is wrong? */
+function isShadowed(name) {
+  return SHADOWED_NAMES.has(name);
+}
+
+/**
+ * Is this a call to a standard-library function the evaluator knows?
+ *
+ * Used by the inline pass to decide whether a table may be copied to its use
+ * site. It answers a narrower question than `evaluateCall`: the argument might
+ * not fold, but the callee must be a function with no side effects and no
+ * interest in a table's identity — `table.concat` reads a table, it never
+ * keeps a reference to it, so handing it a copy is the same call.
+ */
+export function isPureStdlibCall(node) {
+  if (!node || node.type !== 'Call') return false;
+  const func = node.func;
+  if (func.type === 'Index' && func.keyIsName && func.obj.type === 'Name') {
+    const lib = func.obj.name;
+    const fn = func.key.value;
+    if (isShadowed(lib)) return false;
+    if (lib === 'string') return STRING_LIB.has(fn);
+    if (lib === 'bit32') return BIT_LIB.has(fn);
+    if (lib === 'math') return MATH_LIB.has(fn);
+    if (lib === 'table') return fn === 'concat';
+    return false;
+  }
+  if (func.type === 'Name') {
+    if (isShadowed(func.name)) return false;
+    return PURE_GLOBALS.has(func.name);
+  }
+  return false;
+}
+
 function evaluateCall(node) {
   const args = [];
   for (const arg of node.args) {
@@ -830,6 +888,7 @@ function evaluateCall(node) {
   if (node.func.type === 'Index' && node.func.keyIsName && node.func.obj.type === 'Name') {
     const lib = node.func.obj.name;
     const fn = node.func.key.value;
+    if (isShadowed(lib)) return null;
     if (lib === 'string' && STRING_LIB.has(fn)) return evaluateStringLib(fn, args);
     if (lib === 'bit32' && BIT_LIB.has(fn)) return evaluateBitLib(fn, args);
     if (lib === 'math' && MATH_LIB.has(fn)) return evaluateMathLib(fn, args);
@@ -839,6 +898,7 @@ function evaluateCall(node) {
 
   if (node.func.type === 'Name') {
     const name = node.func.name;
+    if (isShadowed(name)) return null;
     if (name === 'tostring') {
       const arg = args[0];
       if (!arg) return null;
@@ -1055,10 +1115,15 @@ function inferName(binding) {
   const fromNew = matchLibraryCall(init, 'Instance', 'new');
   if (fromNew) return { to: lowerFirst(fromNew), evidence: `assigned from Instance.new("${fromNew}")` };
 
-  // `local http = game:GetService("HttpService")`
+  // `local http = game:GetService("HttpService")`, and the bracketed spelling
+  // `game["GetService"]("HttpService")` that obfuscators prefer.
   if (init && init.type === 'MethodCall' && init.method === 'GetService') {
     const service = firstStringArg(init);
     if (service) return { to: lowerFirst(service), evidence: `assigned from :GetService("${service}")` };
+  }
+  const fromService = matchLibraryCall(init, 'game', 'GetService');
+  if (fromService) {
+    return { to: lowerFirst(fromService), evidence: `assigned from game["GetService"]("${fromService}")` };
   }
 
   // `local module = require(...)`
@@ -1112,12 +1177,24 @@ function inferName(binding) {
   return null;
 }
 
+/**
+ * `game:GetService("X")` or `game.GetService("X")`, as a name hint.
+ *
+ * `game["GetService"]("Players")` counts too: obfuscators write the bracketed
+ * form precisely because it is harder to read, and a name is no less inferable
+ * through a string index than through a dot.
+ */
 function matchLibraryCall(init, lib, method) {
   if (!init || init.type !== 'Call') return null;
   const target = init.func;
-  if (!target || target.type !== 'Index' || !target.keyIsName) return null;
+  if (!target || target.type !== 'Index') return null;
   if (target.obj.type !== 'Name' || target.obj.name !== lib) return null;
-  if (target.key.value !== method) return null;
+  const key = target.keyIsName
+    ? target.key.value
+    : target.key && target.key.type === 'Str'
+      ? target.key.value
+      : null;
+  if (key !== method) return null;
   return firstStringArg(init);
 }
 
@@ -1325,6 +1402,10 @@ export function deobfuscate(source, options = {}) {
   const ast = { body: parsed.body };
   const detection = detectObfuscation(ast, source, parsed.tokens);
 
+  // The evaluator may only treat `string.char` as the library when `string` is
+  // not a local. Computed once, over-broad on purpose: see setShadowedNames.
+  setShadowedNames(localNames(ast));
+
   const stats = {
     folded: 0,
     inlined: 0,
@@ -1334,17 +1415,19 @@ export function deobfuscate(source, options = {}) {
     unwrappedLoops: 0,
     deadDeclarations: 0,
     loadstringsInlined: 0,
+    decodedLoops: 0,
     skippedCaptured: 0,
   };
   const report = {
     warnings: [],
     inlinedNames: [],
     loadstrings: [],
+    decoded: [],
     renames: [],
     passes: 0,
   };
 
-  const key = () => `${stats.folded}|${stats.inlined}|${stats.deadBranches}|${stats.liveBranches}|${stats.deadLoops}|${stats.unwrappedLoops}|${stats.deadDeclarations}|${stats.loadstringsInlined}`;
+  const key = () => `${stats.folded}|${stats.inlined}|${stats.deadBranches}|${stats.liveBranches}|${stats.deadLoops}|${stats.unwrappedLoops}|${stats.deadDeclarations}|${stats.loadstringsInlined}|${stats.decodedLoops}`;
 
   for (let pass = 0; pass < maxPasses; pass += 1) {
     report.passes = pass + 1;
@@ -1360,6 +1443,12 @@ export function deobfuscate(source, options = {}) {
 
     if (fold) {
       const scope = analyzeScope(ast);
+      // Decode loops first: folding one turns the accumulator into a constant,
+      // which is what lets the inline pass collapse `table.concat(out)`.
+      eachBlock(ast, (body) => {
+        foldDecodeLoops({ body }, scope.bindings, stats, report);
+        return body;
+      });
       inlineConstants(ast, scope.bindings, stats, report);
       eachBlock(ast, (body) => {
         body.forEach((stat) => foldTree(stat, stats));
@@ -1446,6 +1535,7 @@ function buildHeader(detection, report, stats) {
     summary.push(`${stats.deadBranches + stats.liveBranches} branch(es) resolved`);
   }
   if (stats.loadstringsInlined) summary.push(`${stats.loadstringsInlined} loadstring inline(s)`);
+  if (stats.decodedLoops) summary.push(`${stats.decodedLoops} decode loop(s) run and folded`);
   if (report.renames.length) summary.push(`${report.renames.length} rename(s)`);
   if (summary.length > 0) {
     lines.push('--');

@@ -428,25 +428,21 @@ $ studio deobfuscate examples/obfuscated/Encoded.server.luau
 -- replaced. Renamed variables are INFERRED from how they are used, not recovered:
 -- an obfuscator discards the original names and nothing can bring them back.
 --
--- 5 constant fold(s), 4 inlined value(s), 2 branch(es) resolved, 1 loadstring inline(s), 5 rename(s).
+-- 7 constant fold(s), 6 inlined value(s), 2 branch(es) resolved, 1 loadstring inline(s), 1 decode loop(s) run and folded, 1 rename(s).
 -- A script written the way a Luau obfuscator writes one, committed so that the
 -- README's output is reproducible rather than illustrative.
-local v1 = { 72, 101, 108, 108, 111 }
-local v2 = {}
-for v3 = 1, #v1 do
-  v2[v3] = string.char(v1[v3])
-end
-local v4 = table.concat(v2) .. ", world"
-print(v4)
-local v5 = game["GetService"]("Players")
-print(v5, "====")
+print("Hello, world")
+local players = game["GetService"]("Players")
+print(players, "====")
 warn("booted")
 ```
 
 The escapes are decoded, the constants are folded, the `if false` branch and the
-unreachable `error` are gone, and the constant `loadstring` is inlined. What is
-left is the machinery that a fold cannot remove: the byte array and the loop that
-decodes it, which is a runtime computation rather than a constant.
+unreachable `error` are gone, and the constant `loadstring` is inlined. The byte
+array and the loop that decoded it are gone too: an expression-by-expression fold
+cannot reach that loop — the string exists only once the loop has run — so the
+loop is *run*, over the values it can see, and the accumulator's initialiser is
+replaced with the result.
 
 #### What it does not do
 
@@ -478,9 +474,10 @@ decodes it, which is a runtime computation rather than a constant.
 The output is printed, re-parsed, and compared against the tree it was printed
 from. If the two differ, **nothing is written** and the command fails with the
 mismatch, because a transform that produced a different program is worse than no
-transform at all. That check caught two real bugs during development — a dropped
-`type` field that printed a table as the literal text `undefined`, and a
-parenthesisation rule that changed `2 ^ -3`.
+transform at all. That check caught three real bugs during development — a
+dropped `type` field that printed a table as the literal text `undefined`, a
+parenthesisation rule that changed `2 ^ -3`, and a table copied into an object
+position where it printed as `({}).concat(t)`.
 
 It is a structural check, not a proof: two different programs can have the same
 tree. Behaviour preservation rests on the per-pass rules, which is why each one
@@ -488,8 +485,9 @@ is narrow and refuses the cases it does not handle:
 
 | pass | rule |
 |---|---|
-| constant folding | only whitelisted pure stdlib calls (`string.*`, `bit32.*`, `math.*`, `table.concat`, `tostring`, `tonumber`, `type`, `select`), arithmetic, comparisons and `and`/`or`/`not` — with Lua's `%`, `//` and `^` semantics, not JavaScript's, and never a value with no literal form such as `inf` or `nan` |
-| inlining | single-assignment locals initialised by a literal and never captured by a closure; a table only when every read is a constant index or a `#` |
+| constant folding | only whitelisted pure stdlib calls (`string.*`, `bit32.*`, `math.*`, `table.concat`, `tostring`, `tonumber`, `type`, `select`), arithmetic, comparisons and `and`/`or`/`not` — with Lua's `%`, `//` and `^` semantics, not JavaScript's, and never a value with no literal form such as `inf` or `nan`; a name that is a local *anywhere* in the file is not treated as a library, because `string.char(72)` is only the standard library if `string` is not yours |
+| inlining | single-assignment locals initialised by a literal and never captured by a closure; a table only when every read folds — a constant in-range index, a `#`, or an argument to a pure standard-library call such as `table.concat` |
+| decode loops | the source is a local bound to a constant array of numbers, declared once and never reassigned; the loop runs `1` to `#source` with step 1; the accumulator is declared on the line above, as `{}` or `""`, and written only by that loop; every element must fold after substituting the element and the index, or the whole loop is left alone |
 | dead code | an `if` only when the condition folds to a boolean; `while true do ... end` unwrapped only when no `break` or `continue` belongs to it; a numeric `for` that cannot iterate |
 | `loadstring` | only a constant chunk, and only when it does not read a name that is a local anywhere in the file — a compiled chunk does not see the caller's locals |
 | renaming | locals only, never globals, with evidence recorded per rename; `--no-rename` turns it off |
@@ -806,7 +804,7 @@ a blob sha, and the generator follows that through the blob API instead.
 ## Tests
 
 ```bash
-npm test          # 377 tests: LZ4, binary codec, XML codec, reflection and the
+npm test          # 392 tests: LZ4, binary codec, XML codec, reflection and the
                   # API access flags, validation, project build, CLI, MCP, script
                   # search/diff/edit, a round-trip test per value type in both
                   # codecs, the Luau lexer, parser, printer and analyser, the
