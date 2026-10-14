@@ -537,6 +537,29 @@ test('obfuscation detection names what it found and what it cannot undo', () => 
   assert.match(escapes.evidence, /\\x48/);
 });
 
+test('a base64 payload is reported with its decoded text', () => {
+  const source = 'local payload = "SGVsbG8sIHdvcmxk"\nprint(payload)';
+  const parsed = parse(source);
+  const detection = detectObfuscation(parsed, source, parsed.tokens);
+  const finding = detection.findings.find((f) => f.technique === 'base64-looking-strings');
+  assert.ok(finding, `expected a base64 finding, got ${detection.techniques.join(', ')}`);
+  assert.match(finding.evidence, /Hello, world/);
+  // The literal is not rewritten: something in the code decodes it at runtime.
+  assert.equal(finding.reversible, 'partly');
+  assert.match(finding.note, /not substituted into the output/);
+});
+
+test('a string that merely uses the base64 alphabet is not called base64', () => {
+  const source = 'local name = "abcdefghijklmnop"\nprint(name)';
+  const parsed = parse(source);
+  const detection = detectObfuscation(parsed, source, parsed.tokens);
+  assert.equal(
+    detection.findings.some((f) => f.technique === 'base64-looking-strings'),
+    false,
+    'sixteen letters are not a payload',
+  );
+});
+
 test('a VM dispatch loop is reported as not reversible', () => {
   const numbers = Array.from({ length: 40 }, (_, i) => i).join(', ');
   const source = [

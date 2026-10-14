@@ -450,6 +450,27 @@ cannot reach that loop — the string exists only once the loop has run — so t
 loop is *run*, over the values it can see, and the accumulator's initialiser is
 replaced with the result.
 
+#### What the detector tells you
+
+`--detect` answers "what is this file, and what can be done about it" without
+changing anything. Beyond names, escapes, `loadstring` and the VM dispatch shape,
+it decodes base64 literals and puts the text in the report — the first thing
+anyone wants when they see a payload:
+
+```
+  [medium] base64-looking-strings: a string literal is base64 that decodes to text
+      evidence: "SGVsbG8sIHdvcmxk" -> "Hello, world"
+      reversible: partly
+      The decoded text is in this report. It is not substituted into the output: the
+      literal is the encoded form, and the code around it is what decodes it at runtime.
+```
+
+That is reported and never rewritten, because substituting the plaintext would
+change what the program receives. "Looks like base64" is not claimed about any
+string that happens to use the alphabet: the value has to round-trip through
+base64 exactly and decode to mostly-printable text with real words in it, so
+`"abcdefghijklmnop"` is a name and `"SGVsbG8sIHdvcmxk"` is a payload.
+
 #### What it does not do
 
 - **It does not recover your original variable names.** They are not in the file
@@ -810,7 +831,7 @@ a blob sha, and the generator follows that through the blob API instead.
 ## Tests
 
 ```bash
-npm test          # 395 tests: LZ4, binary codec, XML codec, reflection and the
+npm test          # 397 tests: LZ4, binary codec, XML codec, reflection and the
                   # API access flags, validation, project build, CLI, MCP, script
                   # search/diff/edit, a round-trip test per value type in both
                   # codecs, the Luau lexer, parser, printer and analyser, the

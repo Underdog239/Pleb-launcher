@@ -101,6 +101,37 @@ export function isGeneratedName(name) {
 }
 
 /**
+ * Decode a literal that is base64 for printable text, or return null.
+ *
+ * The check is deliberately strict, because "looks like base64" is a claim that
+ * should not be made about any string that happens to use the alphabet: the
+ * value has to round-trip through base64 exactly, and the bytes have to be
+ * mostly printable ASCII. A name like `SGVsbG9Xb3JsZA` is evidence; a name like
+ * `abcdefghijklmnop` is not.
+ */
+function decodeBase64Text(value) {
+  if (typeof value !== 'string' || value.length < 12 || value.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  let bytes;
+  try {
+    bytes = Buffer.from(value, 'base64');
+  } catch {
+    return null;
+  }
+  if (bytes.length === 0) return null;
+  if (bytes.toString('base64').replace(/=+$/, '') !== value.replace(/=+$/, '')) return null;
+  let printable = 0;
+  for (const byte of bytes) {
+    if (byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte < 127)) printable += 1;
+  }
+  if (printable / bytes.length < 0.85) return null;
+  const text = bytes.toString('utf8');
+  // A payload of pure hex or digits round-trips too, and is usually not text.
+  if (!/[A-Za-z]{3}/.test(text)) return null;
+  return text;
+}
+
+/**
  * Escape density, measured on the literal as it is *written*.
  *
  * This has to look at the source spelling rather than the decoded value: the
@@ -200,15 +231,31 @@ export function detectObfuscation(ast, source = '', tokens = null) {
     });
   }
 
-  const b64ish = strings.filter((s) => /^[A-Za-z0-9+/=]{24,}$/.test(s.value) && s.value.length % 4 === 0);
+  // Base64 is the workhorse of obfuscated payloads, and the first thing an
+  // analyst wants is the decoded text. This reports it and does not rewrite it:
+  // the literal is the *encoded* form, so turning it into plaintext would change
+  // what the program receives. Something in the code has to decode it, and that
+  // something is usually a function the file defines.
+  const b64ish = [];
+  for (const s of strings) {
+    const decoded = decodeBase64Text(s.value);
+    if (decoded) b64ish.push({ value: s.value, decoded });
+  }
   if (b64ish.length > 0) {
+    const first = b64ish[0];
+    const preview = first.decoded.length > 40 ? `${first.decoded.slice(0, 40)}...` : first.decoded;
     findings.push({
       technique: 'base64-looking-strings',
       severity: 'medium',
-      detail: `${b64ish.length} string literals look like base64`,
-      evidence: describeString(b64ish[0].value),
-      reversible: 'yes',
-      note: 'Decoded where the payload is printable text.',
+      detail:
+        b64ish.length === 1
+          ? 'a string literal is base64 that decodes to text'
+          : `${b64ish.length} string literals are base64 that decode to text`,
+      evidence: `${JSON.stringify(first.value)} -> ${JSON.stringify(preview)}`,
+      reversible: 'partly',
+      note:
+        'The decoded text is in this report. It is not substituted into the output: the ' +
+        'literal is the encoded form, and the code around it is what decodes it at runtime.',
     });
   }
 
