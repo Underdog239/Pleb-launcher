@@ -145,12 +145,47 @@ Five task creations per minute, 200 status reads per minute, 45 log reads per
 minute, ten incomplete tasks per place. Retained: 450 KB of logs, task metadata
 for 24 hours. All five endpoints are marked stable.
 
+**Publishing the place that gets run**
+
+`studio exec` loads whatever version is current, so the place it tests is only
+yours if you put it there. `publish` does that:
+
+```bash
+studio publish out.rbxl --universe 123456 --place-id 987654
+studio publish default.project.json --universe 123456 --place-id 987654   # builds first
+studio publish out.rbxl --universe 123456 --place-id 987654 --version-type Saved
+```
+
+A Rojo project or a build spec is built to a temporary place file and then
+published, and the JSON output says so (`builtFrom`), so nothing is quietly
+deployed from something other than what you named. `--version-type Published`
+saves and makes it live; `Saved` saves a version that is not the live one.
+
+Note the version of this endpoint: it is **v1 under `/universes`**, not under
+`/cloud/v2` like Luau Execution, and the place file is the raw request body
+rather than a multipart form. It also needs a **different key scope** —
+`universe-places` with the Write operation — which is why the missing-key
+message distinguishes the two operations rather than printing one generic
+sentence for both.
+
+`deploy` is the whole loop, and pins the smoke test to the version it just
+published:
+
+```bash
+studio deploy default.project.json --universe 123456 --place-id 987654 --run smoke.luau
+```
+
+Pinning matters. A deploy that publishes version 41 and then runs against
+"latest" is measuring whatever version is newest at the moment the task starts,
+which is not necessarily 41 if anything else published in between.
+
 **What is verified, and what is not**
 
-The request shape, the polling loop, the log flattening, the failure paths and
-every error message are tested against a stub server that speaks the same three
-endpoints (`test/opencloud.test.mjs`, `test/fixtures/stub-server.mjs`) — real
-HTTP, real headers, real status codes, no network.
+The request shapes, the polling loop, the log flattening, the publishing body
+and content type, the failure paths and every error message are tested against a
+stub server that speaks the same endpoints (`test/opencloud.test.mjs`,
+`test/fixtures/stub-server.mjs`) — real HTTP, real headers, real status codes,
+real aborts, no network.
 
 **No live call to Roblox's Open Cloud API has ever been made from this
 repository.** There is no key here and no published place to point at, so the

@@ -40,6 +40,32 @@ function writeTempScript(args, script) {
   return file;
 }
 
+/**
+ * A place file to publish: either the path itself, or a project/spec built to
+ * a temporary place file.
+ *
+ * Building goes through the same builder as `studio build`, so a project that
+ * would fail the local validation is not quietly deployed.
+ */
+function placeFileFor(source, ctx) {
+  if (!source) throw new Error('publish_place needs a place file, project, or spec');
+  const ext = path.extname(String(source)).toLowerCase();
+  if (ext === '.rbxl' || ext === '.rbxlx') return source;
+  if (ext !== '.json') {
+    throw new Error(
+      `cannot publish ${source}: expected a .rbxl/.rbxlx place file, or a .json project/spec`,
+    );
+  }
+
+  const spec = JSON.parse(fs.readFileSync(source, 'utf8'));
+  const roots =
+    spec.className || spec.class ? local.modelFromSpec(spec) : local.buildFromProject(source).roots;
+  const target = path.join(os.tmpdir(), `studio-mcp-publish-${process.pid}-${Date.now()}.rbxl`);
+  saveModel(target, roots);
+  void ctx;
+  return target;
+}
+
 /** Read a script file, with an error that says which path failed. */
 function readScriptFile(file) {
   if (!file) throw new Error('execute_luau needs either scriptFile or script');
@@ -515,6 +541,63 @@ export const tools = [
           'Set ROBLOX_CLOUD_API_KEY (scope universe.place.luau-execution-session:write) and pass ' +
           'backend "opencloud" with universeId and placeId.',
       );
+    },
+  },
+  {
+    name: 'publish_place',
+    description:
+      'Publish a built place to Roblox through Open Cloud, without Studio. Takes a .rbxl/.rbxlx place file, or a Rojo project or build spec (which is built first). Defaults to versionType "Saved", which creates a version that is NOT live; pass "Published" explicitly to make it the version players load. Requires ROBLOX_CLOUD_API_KEY with the universe-places:Write permission.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: {
+          type: 'string',
+          description: 'Place file, or a .json project/spec to build and then publish',
+        },
+        universeId: { type: 'integer' },
+        placeId: { type: 'integer' },
+        versionType: {
+          type: 'string',
+          enum: ['Saved', 'Published'],
+          description: '"Saved" (default) is not live; "Published" makes it live',
+        },
+      },
+      required: ['source', 'universeId', 'placeId'],
+    },
+    handler: async (args, ctx) => {
+      if (!opencloud.available()) throw new Error(opencloud.unavailableReason('publish'));
+      if (!args.universeId || !args.placeId) {
+        throw new Error('publish_place needs universeId and placeId');
+      }
+      // Default to a save rather than a publish: a tool call has no "are you
+      // sure?" step, and making a build live is the kind of side effect that
+      // should be asked for in as many words.
+      const versionType = args.versionType ?? 'Saved';
+      if (!['Saved', 'Published'].includes(versionType)) {
+        throw new Error(`versionType must be "Saved" or "Published", not "${versionType}"`);
+      }
+
+      const file = placeFileFor(args.source, ctx);
+      const result = await opencloud.publishPlace({
+        placeFile: file,
+        universeId: args.universeId,
+        placeId: args.placeId,
+        versionType,
+      }).catch((err) => {
+        throw new Error(opencloud.explainPublishError(err));
+      });
+
+      return {
+        versionNumber: result.versionNumber,
+        versionType: result.versionType,
+        bytes: result.bytes,
+        placeFile: result.placeFile,
+        ...(file === args.source ? {} : { builtFrom: args.source }),
+        note:
+          versionType === 'Saved'
+            ? 'saved as a version that is not live'
+            : 'published: this is now the version new servers load',
+      };
     },
   },
   {

@@ -8,15 +8,30 @@ It reads and writes real `.rbxm`/`.rbxl`/`.rbxmx`/`.rbxlx` files, walks the
 instance tree, builds Rojo-style projects, renders an approximate view of a
 scene, and exposes everything over the Model Context Protocol.
 
-It has **one command surface and two pluggable backends**:
+It has **one command surface and three pluggable backends**:
 
 | backend | fidelity | needs Studio | runs on |
 |---|---|---|---|
 | `local` | approximate — file I/O, tree, build, view | no | any OS, incl. Linux/CI |
 | `studio` | full — real engine, real physics, real Luau | yes (Win/macOS) | Windows / macOS |
+| `opencloud` | real engine, real server, no physics, no render | no — an API key | any OS, incl. Linux/CI |
 
-`--backend auto` (the default) prefers Studio when it is installed and falls
-back to `local` otherwise.
+`--backend auto` (the default) picks the highest fidelity the host can actually
+reach: Studio when it is installed, then Open Cloud when a key is present, then
+`local`.
+
+The `opencloud` backend is what makes the loop close on a Linux box:
+**build a place → publish it → run a script against that exact version**, with
+no Studio and no GUI anywhere in the chain.
+
+```bash
+export ROBLOX_CLOUD_API_KEY=...   # scope: universe-places:write, luau-execution:write
+
+studio deploy default.project.json --universe 123456 --place-id 987654 --run smoke.luau
+#   published Published version 41 from /tmp/studio-publish-1234.rbxl (built from default.project.json)
+#   ok: 812 instances, no problems
+#   { scriptRanOnServer = true, descendants = 812 }
+```
 
 ## Why
 
@@ -33,13 +48,20 @@ This project covers that ground:
 - **Perceive** a scene as structured JSON, or as an approximate SVG projection.
 - **Search, diff and edit** scripts inside a model without extracting anything.
 - **Check Luau statically** against the real API database — unknown classes,
-  services, enums and enum items, property typos, deprecated calls — with a
-  line, a column and a fix for each.
+  services, enums and enum items, property typos, deprecated calls, and the
+  properties a game script *cannot write* — with a line, a column and a fix for
+  each. The access data comes straight from the API dump: 691 persisted
+  properties are write-restricted, and an assignment that silently does nothing
+  at runtime is exactly the class of bug a linter should catch.
 - **Map the require graph** of a place and report missing modules, non-module
   targets, and cycles before anything runs.
 - **Answer "what breaks if I delete this?"** from the reference graph, and
   inventory every asset a build depends on.
-- **Execute** Luau with full engine fidelity through Studio when available.
+- **Execute** Luau with full engine fidelity: through Studio when it is
+  installed, or through Roblox's Open Cloud on a real server when you have a
+  key — headless, on Linux, in CI.
+- **Deploy**: build a place, publish it as a version, and run a smoke test
+  against the exact version you just published, in one command with no GUI.
 - **Speak MCP**, so agents talk to it exactly like they talk to Studio's own
   built-in MCP server.
 - **Fail loudly.** Every write is validated first; a bad property, a wrong type,
@@ -60,14 +82,22 @@ whole point of the project is that nothing fails quietly:
 | Read/modify an arbitrary `.rbxm` you were handed | no | **yes** |
 | Script search, diff and edit inside a model | no | **yes** |
 | Static analysis of Luau against the API database | no | **yes** |
+| Knows which properties a game script cannot write | no | **yes** |
 | Require graph and cycle detection | no | **yes** |
 | Reference graph, impact analysis, asset inventory | no | **yes** |
 | Machine-readable diagnostics for every write | no | **yes** |
+| Publish a place, then run a script against that version | no | **yes**, via Open Cloud |
 | MCP tool surface | no | **yes** |
 
 It is not a Rojo replacement; it is the offline, agent-facing half. Rojo owns
 the live-sync workflow, and this project deliberately consumes Rojo's ecosystem
-data (the reflection and patch databases come from **rbx-dom**).
+data (the reflection and patch databases come from **rbx-dom** — so where the
+question is "does this property exist", the two agree by construction, and the
+difference is that one exposes it to an agent and the other does not).
+
+The rows Rojo wins are not incidental: its plugin, its live sync, and its years
+of production use are real advantages this project does not have and does not
+try to match.
 
 ### Project format compatibility
 
@@ -230,6 +260,12 @@ studio edit game.rbxl '[{"path":"ServerScriptService.Main","find":"print(","repl
 studio exec smokeTest.luau --place game.rbxl --backend studio
 studio api dump -o api.json --backend studio
 
+# Real engine execution and deployment, headless (needs an Open Cloud API key)
+studio exec smoke.luau --backend opencloud --universe 123456 --place-id 987654
+studio publish out.rbxl --universe 123456 --place-id 987654
+studio publish default.project.json --universe 123456 --place-id 987654 --version-type Saved
+studio deploy default.project.json --universe 123456 --place-id 987654 --run smoke.luau
+
 # Drive the MCP surface directly
 studio tools
 studio call create_model '{"spec":{"className":"Part","name":"P"},"output":"p.rbxm"}'
@@ -369,9 +405,11 @@ studio doctor
 # ok    node: v22.22.3
 # ok    reflection database: 935 classes, 648 enums
 # ok    serialization patches: BasePart.Size -> size, BasePart.Color -> Color3uint8
-# ok    mcp tools: 21 exposed
+# ok    mcp tools: 23 exposed
+# ok    api data: 935 classes, 648 enums, 3700 enum items, 1822 properties with access flags
 # ok    value type coverage: 363/370 binary, 361/370 xml (370 types in use)
 # ok    roblox studio: not installed (local backend only — no engine Luau; no MCP server)
+# ok    open cloud: no api key: headless engine Luau unavailable (set ROBLOX_CLOUD_API_KEY to enable)
 ```
 
 ```json
@@ -504,8 +542,14 @@ Tools exposed (names mirror Studio's own MCP server where they overlap):
 | `view_scene` | yes | yes | approximate SVG / JSON |
 | `diff_models` | yes | yes | what changed between two models |
 | `multi_edit` | yes | yes | edit script sources, all-or-nothing |
-| `execute_luau` | no | yes | real engine, command-bar permission |
+| `execute_luau` | no | yes | real engine; Studio (command-bar) or Open Cloud |
+| `publish_place` | no | no | Open Cloud publish/save; defaults to a save, not a deploy |
 | `api_dump` | no | yes | Studio's API surface |
+
+`publish_place` defaults to `versionType: "Saved"`, which creates a version that
+is *not* live, and makes going live an explicit `"Published"`. A tool call has
+no "are you sure?" step, and a deploy is not something an agent should do by
+accident.
 
 ## Architecture
 
@@ -521,6 +565,10 @@ src/
   luau/requires.js       require graph over the real instance tree
   rbx/graph.js           reference graph, asset inventory, impact analysis
   backends/studio/       Studio CLI flags + MCP proxy (real engine)
+  backends/opencloud/    Luau Execution + place publishing (real engine, headless)
+    index.js             run a script on Roblox's servers, poll, collect logs
+    publish.js           publish/save a place file as a new version
+    http.js              one request path, every status turned into a sentence
   rbx/
     binary.js            rbxm/rbxl binary codec
     xml.js               rbxmx/rbxlx XML codec
@@ -540,8 +588,11 @@ src/
 Nothing about the engine's data model is guessed:
 
 - **`src/rbx/reflection.json`** is generated from Roblox's official API dump
-  (`scripts/gen-reflection.mjs`) — 935 classes, 648 enums, and per-property
-  serialization flags.
+  (`scripts/gen-reflection.mjs`) — 935 classes, 648 enums, and 1822 properties
+  annotated with what the dump actually records: read and write security, and
+  whether each one is read-only, deprecated, scriptable or replicated. Those
+  flags are what let the linter say that `HttpService.HttpEnabled` cannot be
+  written from a game script instead of leaving you to find out at runtime.
 - **`src/rbx/patches.json`** is generated from rbx-dom's patch database
   (`scripts/gen-patches.mjs`) — the serialization aliases the API dump does not
   describe, e.g. `BasePart.Size` -> `size` and `BasePart.Color` -> `Color3uint8`.
@@ -551,15 +602,24 @@ Nothing about the engine's data model is guessed:
 Regenerate both:
 
 ```bash
-node scripts/gen-reflection.mjs     # needs network (or a local API-Dump.json)
+node scripts/gen-reflection.mjs     # fetches the dump from the Client-Tracker mirror
+node scripts/gen-reflection.mjs path/to/API-Dump.json
 node scripts/gen-patches.mjs        # needs network
 ```
 
+`gen-reflection.mjs` accepts a local path, a URL, or `github:owner/repo:path`.
+The `github:` form is the default because it works where `raw.githubusercontent`
+is blocked: files over 1 MiB come back from the contents API with no content and
+a blob sha, and the generator follows that through the blob API instead.
+
 ## Honest limitations
 
-- **There is no headless Roblox.** The engine is closed source, there is no
+- **There is no headless Studio.** The engine is closed source, there is no
   Linux build of Studio, and Studio has no headless mode. Anything claiming
-  otherwise is wrong.
+  otherwise is wrong. The one way to run the *real engine* without a GUI is
+  Roblox's own Open Cloud Luau Execution, which the `opencloud` backend drives —
+  and that is a constrained engine: no physics stepping, no rendering, five
+  minutes per task, and the place's own scripts are deliberately not started.
 - The `local` backend **cannot execute engine Luau or run physics**. It is a
   file/tree/authoring tool with an approximate renderer, not an engine.
 - `view_scene` is a top-down **axis-aligned projection** — good for layout and
@@ -567,20 +627,36 @@ node scripts/gen-patches.mjs        # needs network
 - The `studio` backend requires Studio and therefore Windows/macOS. Studio's
   documented CLI flags (`--task RunScript`, `--api`, ...) are stable; any
   undocumented flag is explicitly subject to change.
-- For headless execution on Linux, the correct path is Roblox's **Open Cloud
-  Luau Execution** API (see `roblox/rocale-cli`), which runs a built place on
-  Roblox's real servers and returns logs. Wiring that in as a third backend is
-  the natural next step.
+- **The `opencloud` backend has never been run against Roblox's live API from
+  this repository.** There is no API key here and no published place to point it
+  at, so the contract is modelled from Roblox's documentation and reference
+  client, and tested against a stub that speaks the same endpoints over real
+  HTTP. Everything except the live call is tested; the live call is not.
+  `docs/backends.md` states exactly which is which.
+- Open Cloud costs are real ones: an API key, a published experience, rate
+  limits of five task creations per minute and ten incomplete tasks per place,
+  and a 4 MB script limit.
+- **`studio check` reasons about Luau; it does not run it.** It reads the API
+  reflection data, so it knows that `HttpService.HttpEnabled` cannot be written
+  from a game script and that `Enum.AlignType.Parallel` is deprecated. It does
+  not know whether your logic is correct. Run the code — `studio exec` on Studio
+  or Open Cloud — to find that out.
 
 ## Tests
 
 ```bash
-npm test          # 242 tests: LZ4, binary codec, XML codec, reflection,
-                  # validation, project build, CLI, MCP, script search/diff/edit,
-                  # a round-trip test per value type in both codecs, the Luau
-                  # lexer and analyser, the require graph, and the reference
-                  # graph / asset inventory / impact analysis
+npm test          # 324 tests: LZ4, binary codec, XML codec, reflection and the
+                  # API access flags, validation, project build, CLI, MCP, script
+                  # search/diff/edit, a round-trip test per value type in both
+                  # codecs, the Luau lexer and analyser, the require graph, the
+                  # reference graph / asset inventory / impact analysis, and the
+                  # Open Cloud backend against a stub server
 ```
+
+Nothing in the suite touches the network. The Open Cloud tests start a local
+HTTP stub that speaks Roblox's three endpoints, so the request shapes, the
+polling loop, the log flattening, the abort path and every error message are
+exercised for real — without an API key and without a live call.
 
 ## Verification against the reference implementation
 

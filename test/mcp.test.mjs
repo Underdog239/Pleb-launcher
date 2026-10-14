@@ -345,10 +345,68 @@ test('execute_luau runs on opencloud and returns logs, results and state', async
 
 test('the tool list is stable and every tool still has a schema', () => {
   const tools = toolList();
-  assert.equal(tools.length, 22);
+  assert.equal(tools.length, 23);
   for (const t of tools) {
     assert.ok(t.name && t.description, `tool ${t.name} needs a name and description`);
     assert.equal(t.inputSchema.type, 'object');
   }
   assert.equal(findTool('execute_luau').inputSchema.properties.backend.enum.join(','), 'studio,opencloud');
+});
+
+test('publish_place defaults to a save, not a deploy', async () => {
+  const { startOpenCloudStub } = await import('./fixtures/stub-server.mjs');
+  const stub = await startOpenCloudStub();
+  const previousKey = process.env.ROBLOX_CLOUD_API_KEY;
+  const previousBase = process.env.ROBLOX_CLOUD_BASE_URL;
+  process.env.ROBLOX_CLOUD_API_KEY = 'dGVzdC1rZXk=';
+  process.env.ROBLOX_CLOUD_BASE_URL = stub.baseUrl;
+  try {
+    const place = path.join(tmp, 'mcp-place.rbxl');
+    fs.writeFileSync(place, Buffer.from([1, 2, 3, 4]));
+    const saved = await callTool('publish_place', { source: place, universeId: 1, placeId: 2 });
+    assert.equal(saved.versionType, 'Saved', 'a tool call must not go live by default');
+    assert.match(saved.note, /not live/);
+    assert.equal(saved.builtFrom, undefined);
+    assert.equal(stub.published.at(-1).contentType, 'application/octet-stream');
+
+    const live = await callTool('publish_place', {
+      source: place,
+      universeId: 1,
+      placeId: 2,
+      versionType: 'Published',
+    });
+    assert.equal(live.versionType, 'Published');
+    assert.match(live.note, /now the version new servers load/);
+    assert.deepEqual(stub.published.map((p) => p.bytes), [4, 4]);
+  } finally {
+    if (previousKey === undefined) delete process.env.ROBLOX_CLOUD_API_KEY;
+    else process.env.ROBLOX_CLOUD_API_KEY = previousKey;
+    if (previousBase === undefined) delete process.env.ROBLOX_CLOUD_BASE_URL;
+    else process.env.ROBLOX_CLOUD_BASE_URL = previousBase;
+    await stub.close();
+  }
+});
+
+test('publish_place builds a spec or project before publishing it', async () => {
+  const { startOpenCloudStub } = await import('./fixtures/stub-server.mjs');
+  const stub = await startOpenCloudStub();
+  const previousKey = process.env.ROBLOX_CLOUD_API_KEY;
+  const previousBase = process.env.ROBLOX_CLOUD_BASE_URL;
+  process.env.ROBLOX_CLOUD_API_KEY = 'dGVzdC1rZXk=';
+  process.env.ROBLOX_CLOUD_BASE_URL = stub.baseUrl;
+  try {
+    const spec = path.join(tmp, 'mcp-spec.json');
+    fs.writeFileSync(spec, JSON.stringify({ className: 'Model', name: 'M' }));
+    const out = await callTool('publish_place', { source: spec, universeId: 1, placeId: 2 });
+    assert.equal(out.builtFrom, spec, 'the caller is told it was built');
+    assert.deepEqual(out.results, undefined);
+    // What travelled was a real place file, not the spec.
+    assert.ok(stub.published.at(-1).bytes > 100, `published ${stub.published.at(-1).bytes} bytes`);
+  } finally {
+    if (previousKey === undefined) delete process.env.ROBLOX_CLOUD_API_KEY;
+    else process.env.ROBLOX_CLOUD_API_KEY = previousKey;
+    if (previousBase === undefined) delete process.env.ROBLOX_CLOUD_BASE_URL;
+    else process.env.ROBLOX_CLOUD_BASE_URL = previousBase;
+    await stub.close();
+  }
 });
