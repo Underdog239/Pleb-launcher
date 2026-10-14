@@ -12,6 +12,7 @@ import {
   isDeprecatedEnumItem,
   dataVersion,
 } from '../src/rbx/reflection.js';
+import fs from 'node:fs';
 import { validateModel } from '../src/rbx/validate.js';
 
 function roundTrip(roots) {
@@ -239,4 +240,71 @@ test('the validator warns about a deprecated class and still validates it', () =
   assert.ok(found, 'expected deprecated-class');
   assert.equal(found.severity, 'warning', 'an existing file full of Hat must still open');
   assert.ok(!result.diagnostics.some((d) => d.severity === 'error'));
+});
+
+test('the access layer decodes flags the same way an independent read does', () => {
+  // A differential check: walk reflection.json by hand, decode the packed
+  // integer with the documented bit layout, and compare every class/property
+  // pair against propertyAccessFor. 3699 pairs, so a decode that is off by one
+  // bit cannot pass by luck.
+  const raw = JSON.parse(fs.readFileSync(new URL('../src/rbx/reflection.json', import.meta.url), 'utf8'));
+  const LEVELS = [
+    'None',
+    'LocalUserSecurity',
+    'PluginSecurity',
+    'RobloxScriptSecurity',
+    'RobloxSecurity',
+    'NotAccessibleSecurity',
+  ];
+  const ADMITS = {
+    None: { game: true, plugin: true, studio: true },
+    LocalUserSecurity: { game: false, plugin: false, studio: true },
+    PluginSecurity: { game: false, plugin: true, studio: true },
+    RobloxScriptSecurity: { game: false, plugin: false, studio: false },
+    RobloxSecurity: { game: false, plugin: false, studio: false },
+    NotAccessibleSecurity: { game: false, plugin: false, studio: false },
+  };
+
+  const expected = (className, propName) => {
+    for (let cur = className; cur && raw.classes[cur]; cur = raw.classes[cur].super) {
+      const entry = raw.classes[cur].props[propName];
+      if (!entry) {
+        if (raw.classes[cur].super === '<<<ROOT>>>') break;
+        continue;
+      }
+      const flags = entry.length > 5 ? entry[5] : 0;
+      const writeSecurity = LEVELS[flags & 7];
+      const readOnly = (flags & (1 << 6)) !== 0;
+      const admits = (who) => ADMITS[writeSecurity][who] && !readOnly;
+      return {
+        writeSecurity,
+        readSecurity: LEVELS[(flags >> 3) & 7],
+        writableFromGame: admits('game'),
+        writableFromPlugin: admits('plugin'),
+        writableFromStudio: admits('studio'),
+        readOnly,
+        deprecated: (flags & (1 << 7)) !== 0,
+        notScriptable: (flags & (1 << 8)) !== 0,
+        recorded: true,
+      };
+    }
+    return null;
+  };
+
+  let checked = 0;
+  const mismatches = [];
+  for (const className of Object.keys(raw.classes)) {
+    for (const propName of Object.keys(raw.classes[className].props)) {
+      const want = expected(className, propName);
+      const got = propertyAccessFor(className, propName);
+      checked += 1;
+      for (const key of Object.keys(want)) {
+        if (want[key] !== got[key]) {
+          mismatches.push(`${className}.${propName}.${key}: want ${want[key]}, got ${got[key]}`);
+        }
+      }
+    }
+  }
+  assert.equal(checked, 3699, 'every declaration in the table is covered');
+  assert.deepEqual(mismatches.slice(0, 5), [], `${mismatches.length} mismatches`);
 });
