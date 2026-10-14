@@ -501,16 +501,20 @@ function applyMeta(inst, meta, warnings, pending = null) {
  *
  * @returns {{roots: Instance[], projectName: string|null, warnings: object[]}}
  */
-export function buildFromProject(projectPath) {
+export function buildFromProject(projectPath, { sources = null } = {}) {
   const abs = path.resolve(projectPath);
   const project = JSON.parse(fs.readFileSync(abs, 'utf8'));
   const baseDir = path.dirname(abs);
   const treeSpec = project.tree || project;
   const warnings = [];
   const pending = [];
+  // `sources` records which file or directory produced each instance. It is
+  // collected here, inside the real walk, rather than by a second pass over the
+  // project: two implementations of these rules would eventually disagree, and
+  // a sourcemap that disagrees with the build points tooling at the wrong file.
   const roots = Object.entries(treeSpec)
     .filter(([key]) => !key.startsWith('$'))
-    .map(([key, spec]) => buildProjectNode(key, spec, baseDir, warnings, null, pending));
+    .map(([key, spec]) => buildProjectNode(key, spec, baseDir, warnings, null, pending, sources));
   // A project can wire one instance to another in either direction, so
   // references are resolved only once every instance exists.
   const { resolved } = resolveReferences(roots, pending, warnings);
@@ -533,7 +537,7 @@ function metaClassName(meta) {
   return meta.className || meta.ClassName || null;
 }
 
-function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = null, pending = null) {
+function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = null, pending = null, sources = null) {
   if (spec === null || typeof spec !== 'object') {
     throw new Error(`invalid project node: ${nodeName}`);
   }
@@ -577,6 +581,14 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
 
   const inst = new Instance(className, nodeName);
   const ser = serializationFor(className);
+  if (sources) {
+    // The directory or file that this instance *is*. For a directory holding an
+    // init script the instance is the directory, but the script file is worth
+    // recording too: it is where the source actually lives.
+    if (targetIsDir) sources.set(inst, { filePaths: [target], scriptFile: initScriptPath });
+    else if (target && !modelTarget) sources.set(inst, { filePaths: [target], scriptFile: target });
+    else if (modelTarget) sources.set(inst, { filePaths: [modelTarget], scriptFile: null });
+  }
 
   if (targetIsDir) {
     if (initScriptPath) {
@@ -597,7 +609,9 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
     for (const entry of entries) {
       const childPath = path.join(target, entry);
       if (fs.statSync(childPath).isDirectory()) {
-        inst.addChild(buildProjectNode(entry, { $path: childPath }, baseDir, warnings, null, pending));
+        inst.addChild(
+          buildProjectNode(entry, { $path: childPath }, baseDir, warnings, null, pending, sources),
+        );
         continue;
       }
       if (entry.toLowerCase().startsWith('init.') && SOURCE_EXTS.has(path.extname(entry).toLowerCase())) continue;
@@ -630,6 +644,7 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
         const child = new Instance(cls, scriptNameFor(entry));
         child.set('Source', fs.readFileSync(childPath, 'utf8'));
         applyMeta(child, readMetaFile(childPath.replace(/\.(lua|luau)$/i, '.meta.json')), warnings);
+        if (sources) sources.set(child, { filePaths: [childPath], scriptFile: childPath });
         inst.addChild(child);
         continue;
       }
@@ -641,6 +656,7 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
       if (dataClass) {
         const child = new Instance(dataClass, entry.slice(0, entry.length - path.extname(entry).length));
         child.set('Value', fs.readFileSync(childPath, 'utf8'));
+        if (sources) sources.set(child, { filePaths: [childPath], scriptFile: null });
         inst.addChild(child);
         continue;
       }
@@ -703,7 +719,7 @@ function buildProjectNode(nodeName, spec, baseDir, warnings, inheritedMeta = nul
 
   for (const [key, child] of Object.entries(spec)) {
     if (key.startsWith('$')) continue;
-    inst.addChild(buildProjectNode(key, child, baseDir, warnings, null, pending));
+    inst.addChild(buildProjectNode(key, child, baseDir, warnings, null, pending, sources));
   }
 
   // $ignoreUnknownInstances only affects live sync, where pre-existing

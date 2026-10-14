@@ -20,6 +20,7 @@ import { db, serializationFor } from './rbx/reflection.js';
 import { analyzeSource, summarizeScripts } from './luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from './luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from './rbx/graph.js';
+import { sourceMapFromProject, sourceMapFromModel, countNodes } from './rbx/sourcemap.js';
 import { describeClass, describeEnum, classesWithProperty, searchApi, apiDataInfo } from './rbx/api.js';
 
 const VERSION = '0.1.0';
@@ -161,6 +162,7 @@ export const FLAGS = {
   quiet: 'boolean',
   'version-type': 'value',
   run: 'value',
+  'include-non-scripts': 'boolean',
 };
 
 const SHORT_FLAGS = { h: 'help', v: 'version', o: 'output', i: 'ignore-case' };
@@ -198,6 +200,7 @@ COMMANDS
          --universe N --place-id N [--version-type Published|Saved]
   deploy <project.json|spec.json>        Build, publish, and optionally smoke-test
          --universe N --place-id N [--run smoke.luau]
+  sourcemap <project|place> [-o F]       sourcemap.json for Luau tooling
   api dump [-o out.json]                 Dump Studio's API surface (needs Studio)
   api class <ClassName>                  Properties, types, and what is saved
   api enum <EnumName>                    Items and their numeric values
@@ -263,6 +266,16 @@ function preparePlaceFile(source, flags) {
   const bytes = saveModel(target, roots);
   return { placeFile: target, built: true, builtBytes: bytes };
 }
+
+/** How many nodes in a sourcemap are scripts. */
+function countScripts(node) {
+  let total = node.className && SCRIPT_CLASSES.has(node.className) ? 1 : 0;
+  for (const child of node.children || []) total += countScripts(child);
+  return total;
+}
+
+// The three classes that hold source, plus the engine's internal ones.
+const SCRIPT_CLASSES = new Set(['Script', 'LocalScript', 'ModuleScript', 'CoreScript']);
 
 /** `versions/3` -> 3; a bare number stays a number. */
 function parseVersion(value) {
@@ -666,6 +679,40 @@ export async function run(argv = process.argv.slice(2)) {
           outputFile: flags.output,
         });
         return out(result, flags);
+      }
+
+      case 'sourcemap': {
+        // The file Luau tooling reads to turn `require(script.Parent.Foo)` into
+        // a path on disk. Works from a project (matching Rojo) or from a built
+        // place (which Rojo cannot do at all).
+        const source = rest[0];
+        if (!source) throw new Error('sourcemap needs a Rojo project or a model file');
+        const ext = path.extname(source).toLowerCase();
+        const isModel = ['.rbxm', '.rbxl', '.rbxmx', '.rbxlx'].includes(ext);
+
+        const { sourcemap, warnings } = isModel
+          ? sourceMapFromModel(loadModel(source), { includeNonScripts: flags['include-non-scripts'] })
+          : sourceMapFromProject(source, { includeNonScripts: flags['include-non-scripts'] });
+
+        for (const w of warnings || []) process.stderr.write(`warning: ${w.message}\n`);
+
+        const json = `${JSON.stringify(sourcemap, null, 2)}\n`;
+        if (flags.output) {
+          fs.writeFileSync(flags.output, json);
+          return out(
+            {
+              output: flags.output,
+              bytes: Buffer.byteLength(json),
+              nodes: countNodes(sourcemap),
+              scripts: countScripts(sourcemap),
+              source: source,
+              ...(warnings && warnings.length ? { warnings } : {}),
+            },
+            flags,
+          );
+        }
+        if (flags.json) return out(sourcemap, flags);
+        return out(json.trimEnd(), flags);
       }
 
       case 'publish': {

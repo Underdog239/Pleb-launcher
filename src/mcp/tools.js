@@ -22,6 +22,7 @@ import { analyzeSource, summarizeScripts } from '../luau/analyze.js';
 import { buildRequireGraph, checkTreeBindings, scriptsInModel } from '../luau/requires.js';
 import { referenceGraph, contentInventory, impactAnalysis, indexByPath } from '../rbx/graph.js';
 import { describeClass, describeEnum, classesWithProperty, searchApi } from '../rbx/api.js';
+import { sourceMapFromProject, sourceMapFromModel, countNodes } from '../rbx/sourcemap.js';
 
 /**
  * The studio backend takes a file, so an inline script is written to one.
@@ -541,6 +542,43 @@ export const tools = [
           'Set ROBLOX_CLOUD_API_KEY (scope universe.place.luau-execution-session:write) and pass ' +
           'backend "opencloud" with universeId and placeId.',
       );
+    },
+  },
+  {
+    name: 'sourcemap',
+    description:
+      'Build a sourcemap for a Rojo project or for an existing place file: the instance tree with the source file behind each node. This is what Luau tooling reads to resolve require(script.Parent.X) to a path on disk, so it is also how an agent finds the file that produced an instance. Works from a project (as Rojo does) or from a built place with no project anywhere (which Rojo cannot do).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Rojo project (.project.json) or a model file' },
+        includeNonScripts: {
+          type: 'boolean',
+          description: 'Include instances that hold no source (default: scripts and their ancestors)',
+        },
+        output: { type: 'string', description: 'Also write the map to this path, e.g. sourcemap.json' },
+      },
+      required: ['source'],
+    },
+    handler: (args) => {
+      const ext = path.extname(String(args.source)).toLowerCase();
+      const isModel = ['.rbxm', '.rbxl', '.rbxmx', '.rbxlx'].includes(ext);
+      const { sourcemap, warnings } = isModel
+        ? sourceMapFromModel(loadRoots(args.source), {
+            includeNonScripts: args.includeNonScripts === true,
+          })
+        : sourceMapFromProject(args.source, { includeNonScripts: args.includeNonScripts === true });
+
+      if (args.output) {
+        fs.writeFileSync(args.output, `${JSON.stringify(sourcemap, null, 2)}\n`);
+      }
+      return {
+        ...(args.output ? { output: args.output } : {}),
+        nodes: countNodes(sourcemap),
+        from: isModel ? 'model' : 'project',
+        ...(warnings && warnings.length ? { warnings } : {}),
+        sourcemap,
+      };
     },
   },
   {

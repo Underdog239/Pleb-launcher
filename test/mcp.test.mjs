@@ -345,7 +345,7 @@ test('execute_luau runs on opencloud and returns logs, results and state', async
 
 test('the tool list is stable and every tool still has a schema', () => {
   const tools = toolList();
-  assert.equal(tools.length, 23);
+  assert.equal(tools.length, 24);
   for (const t of tools) {
     assert.ok(t.name && t.description, `tool ${t.name} needs a name and description`);
     assert.equal(t.inputSchema.type, 'object');
