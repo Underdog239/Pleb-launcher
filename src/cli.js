@@ -192,6 +192,12 @@ COMMANDS
   diff <before> <after>                  Structural diff of two models
   edit <file> '[{"path":P,"find":A,"replace":B}]'   Edit script sources
   exec <script.luau> [--place F]         Run Luau in Studio (studio backend)
+  exec <script.luau> --backend opencloud Run Luau on Roblox's servers, headless
+         --universe N --place-id N [--place-version N] [--poll S] [--timeout S]
+  publish <file|project.json>            Publish a place through Open Cloud
+         --universe N --place-id N [--version-type Published|Saved]
+  deploy <project.json|spec.json>        Build, publish, and optionally smoke-test
+         --universe N --place-id N [--run smoke.luau]
   api dump [-o out.json]                 Dump Studio's API surface (needs Studio)
   api class <ClassName>                  Properties, types, and what is saved
   api enum <EnumName>                    Items and their numeric values
@@ -205,7 +211,7 @@ COMMANDS
   proxy                                  Bridge stdio to Studio's own MCP server
 
 GLOBAL OPTIONS
-  --backend <auto|local|studio>   Which engine to use (default: auto)
+  --backend <auto|local|studio|opencloud>   Which engine to use (default: auto)
   --strict                        Treat warnings as failures
   --force                         Write even when validation fails
   --json                          Machine-readable output only
@@ -214,6 +220,9 @@ GLOBAL OPTIONS
 
 Options take a value as '--output x' or '--output=x'; an unknown option is an
 error, never a positional argument.
+
+"auto" picks the highest fidelity this host can reach: Studio when it is
+installed, then Open Cloud when ROBLOX_CLOUD_API_KEY is set, then local.
 
 Model files: .rbxm .rbxl (binary) and .rbxmx .rbxlx (XML).
 `;
