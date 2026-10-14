@@ -1416,6 +1416,7 @@ export function deobfuscate(source, options = {}) {
     deadDeclarations: 0,
     loadstringsInlined: 0,
     decodedLoops: 0,
+    decodedStrings: 0,
     skippedCaptured: 0,
   };
   const report = {
@@ -1468,6 +1469,54 @@ export function deobfuscate(source, options = {}) {
 
   if (rename) renameBindings(ast, analyzeScope(ast).bindings, report, { renameAll });
 
+  // Nothing to do: hand the source back as written.
+  //
+  // Reprinting an untouched file would still rewrite its layout — tabs to two
+  // spaces, short tables onto one line — and a tool whose answer for clean code
+  // is "here is your file, reformatted" is a tool people stop running over
+  // their repository. The output is byte-identical apart from the header.
+  // The one thing the shortcut would lose is escape decoding: `"\x48\x65\x6c"`
+  // is `"Hel"` in the tree, so printing is what makes a reader able to read it,
+  // and returning the source as written would keep the escapes. A literal only
+  // counts as encoded when it is *mostly* escapes — the same measure the
+  // detector uses — so `"\n%s.%s:"` in a format string and `' "'` in a message
+  // do not force a reprint of an otherwise untouched file.
+  // The one thing the shortcut would lose is escape decoding: `"\x48\x65\x6c"`
+  // is `"Hel"` in the tree, so printing is what makes a reader able to read it,
+  // and returning the source as written would keep the escapes. A literal only
+  // counts as encoded when it is *mostly* escapes — the same measure the
+  // detector uses — so `"\n%s.%s:"` in a format string and `' "'` in a message
+  // do not force a reprint of an otherwise untouched file.
+  const escapedLiterals = parsed.tokens.filter(
+    (token) => token.type === 'string' && escapeDensity(source.slice(token.start, token.end)) > 0.3,
+  ).length;
+  stats.decodedStrings = escapedLiterals;
+  const respelled = escapedLiterals > 0;
+
+  const changed =
+    Object.entries(stats).some(([k, v]) => v > 0 && k !== 'skippedCaptured') ||
+    report.renames.length > 0;
+
+  if (!changed) {
+    const head = buildHeader(detection, report, stats);
+    return {
+      code: `${head}\n${source.replace(/^\uFEFF/, '')}`,
+      report: {
+        ...report,
+        transformations: stats,
+        changed: false,
+      },
+      detection,
+      verification: {
+        outputReparses: true,
+        treeMatchesOutput: true,
+        unchanged: true,
+        note: 'No transformation applied, so the source was returned as written. It was ' +
+          'parsed (the analysis ran on the real tree) and is byte-identical apart from the header.',
+      },
+    };
+  }
+
   const header = buildHeader(detection, report, stats);
   const code = print(ast, { header });
 
@@ -1498,9 +1547,7 @@ export function deobfuscate(source, options = {}) {
     report: {
       ...report,
       transformations: stats,
-      changed:
-        Object.entries(stats).some(([k, v]) => v > 0 && k !== 'skippedCaptured') ||
-        report.renames.length > 0,
+      changed,
     },
     detection,
     verification: {
@@ -1516,6 +1563,14 @@ export function deobfuscate(source, options = {}) {
 
 /** The header written above generated output, so the provenance travels with it. */
 function buildHeader(detection, report, stats) {
+  const touched =
+    Object.entries(stats).some(([k, v]) => v > 0 && k !== 'skippedCaptured') || report.renames.length > 0;
+  if (!touched) {
+    return detection.obfuscated
+      ? '-- Checked by studio-cli (studio deobfuscate): obfuscation found, but nothing here\n' +
+          '-- could be reversed automatically. See studio deobfuscate --detect.'
+      : '-- Checked by studio-cli (studio deobfuscate): nothing to change.';
+  }
   const lines = [
     '-- Deobfuscated by studio-cli (studio deobfuscate).',
     '--',
@@ -1529,6 +1584,7 @@ function buildHeader(detection, report, stats) {
     lines.push('-- See the report for what that means; this file was not fully reversed.');
   }
   const summary = [];
+  if (stats.decodedStrings) summary.push(`${stats.decodedStrings} escape-encoded string(s) decoded`);
   if (stats.folded) summary.push(`${stats.folded} constant fold(s)`);
   if (stats.inlined) summary.push(`${stats.inlined} inlined value(s)`);
   if (stats.deadBranches + stats.liveBranches) {

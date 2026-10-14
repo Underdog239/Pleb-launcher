@@ -780,6 +780,7 @@ export async function run(argv = process.argv.slice(2)) {
               (result.detection.techniques.length
                 ? ` (${result.detection.techniques.join(', ')})`
                 : ' (nothing found)'),
+            `  strings decoded:   ${result.report.transformations.decodedStrings}`,
             `  constants folded:  ${result.report.transformations.folded}`,
             `  values inlined:    ${result.report.transformations.inlined}`,
             `  branches resolved: ${result.report.transformations.deadBranches + result.report.transformations.liveBranches}`,

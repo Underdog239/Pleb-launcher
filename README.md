@@ -420,6 +420,12 @@ examples/obfuscated/Encoded.server.luau: obfuscation detected (score 75/100)
       A loadstring call whose argument folds to a constant is inlined here. One whose argument depends on runtime state cannot be: the code does not exist until it runs.
 ```
 
+A file that needs nothing comes back **byte-identical** apart from the header —
+same indentation, same comments, same quote style. Reformatting code that was
+never obfuscated is churn in someone's repository, and this is a tool you should
+be able to point at all of it. (The one exception is an escape-encoded literal,
+which is decoded and so forces the file through the printer.)
+
 ```console
 $ studio deobfuscate examples/obfuscated/Encoded.server.luau
 -- Deobfuscated by studio-cli (studio deobfuscate).
@@ -428,7 +434,7 @@ $ studio deobfuscate examples/obfuscated/Encoded.server.luau
 -- replaced. Renamed variables are INFERRED from how they are used, not recovered:
 -- an obfuscator discards the original names and nothing can bring them back.
 --
--- 7 constant fold(s), 6 inlined value(s), 2 branch(es) resolved, 1 loadstring inline(s), 1 decode loop(s) run and folded, 1 rename(s).
+-- 7 escape-encoded string(s) decoded, 7 constant fold(s), 6 inlined value(s), 2 branch(es) resolved, 1 loadstring inline(s), 1 decode loop(s) run and folded, 1 rename(s).
 -- A script written the way a Luau obfuscator writes one, committed so that the
 -- README's output is reproducible rather than illustrative.
 print("Hello, world")
@@ -804,7 +810,7 @@ a blob sha, and the generator follows that through the blob API instead.
 ## Tests
 
 ```bash
-npm test          # 392 tests: LZ4, binary codec, XML codec, reflection and the
+npm test          # 395 tests: LZ4, binary codec, XML codec, reflection and the
                   # API access flags, validation, project build, CLI, MCP, script
                   # search/diff/edit, a round-trip test per value type in both
                   # codecs, the Luau lexer, parser, printer and analyser, the

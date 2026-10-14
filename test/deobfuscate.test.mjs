@@ -217,7 +217,7 @@ test('a table is inlined only where every use is a constant index or a length', 
   // A variable index means the table is being used as a table, so copying the
   // literal to the use site would build a second table.
   const variable = body(deobfuscate('local t = {"a", "b"}\nfor i = 1, #t do print(t[i]) end').code);
-  assert.match(variable, /local t = \{ "a", "b" \}/);
+  assert.match(variable, /local t = \{\s*"a",\s*"b"\s*\}/, 'the table stays a table');
   assert.match(variable, /t\[i\]/);
 });
 
@@ -354,7 +354,7 @@ test('a table is copied into a pure call but not into a function of unknown orig
   // A user function might keep the table or mutate it, so it must not be
   // copied to the use site.
   const user = body(deobfuscate('local t = {1, 2}\nlocal function keep(x) return x end\nprint(keep(t))').code);
-  assert.match(user, /local t = \{ 1, 2 \}/);
+  assert.match(user, /local t = \{\s*1,\s*2\s*\}/, 'the table stays a table');
   assert.match(user, /print\(keep\(t\)\)/);
 
   // ...and neither must a shadowed `table`.
@@ -603,6 +603,46 @@ test('the output says what was and was not recovered', () => {
   const header = result.code.split('\n').filter((l) => l.startsWith('--')).join('\n');
   assert.match(header, /INFERRED from how they are used, not recovered/);
   assert.match(header, /nothing can bring them back/);
+});
+
+test('a clean file comes back byte-identical apart from the header', () => {
+  // Reformatting a file that needed nothing is churn in someone's repository,
+  // and this is a tool people should be able to run over all of it.
+  const source = [
+    '-- A module, written by hand with tabs.',
+    'local M = {}',
+    '',
+    'function M.add(a, b)',
+    '\treturn a + b -- keep this comment',
+    'end',
+    '',
+    'return M',
+    '',
+  ].join('\n');
+  const result = deobfuscate(source);
+  assert.equal(result.report.changed, false);
+  assert.ok(result.code.endsWith(source), 'the source is returned as written');
+  assert.match(result.code, /nothing to change/);
+  assert.equal(result.verification.unchanged, true);
+});
+
+test('an escape-encoded literal is still decoded, and counted', () => {
+  // Decoding happens at parse time, but printing is what puts the value in the
+  // output — so this cannot take the byte-identical shortcut.
+  const source = String.raw`return "\x48\x65\x6c\x6c\x6f"` + '\n';
+  const result = deobfuscate(source);
+  assert.match(result.code, /return "Hello"/);
+  assert.equal(result.report.transformations.decodedStrings, 1);
+  assert.equal(result.report.changed, true);
+});
+
+test('a backslash in a format string does not force a rewrite', () => {
+  // `"\n%s"` is not obfuscation, and a clean file containing one is still
+  // returned as written.
+  const source = 'print(string.format("%s:\\n", name))\n';
+  const result = deobfuscate(source);
+  assert.equal(result.report.transformations.decodedStrings, 0);
+  assert.ok(result.code.endsWith(source));
 });
 
 test('deobfuscating idiomatic code changes nothing that matters', () => {
